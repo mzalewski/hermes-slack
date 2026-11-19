@@ -74,10 +74,11 @@ def test_render_shows_actionable_counts_closed_and_skips_clean_prs():
     assert "⛔" in text and "`a/b.js:1`" in text and "<https://x/1|view>" in text
 
 
-def test_render_orders_prs_newest_first_caps_findings_and_blocks():
+def test_render_keeps_given_order_caps_findings_and_blocks():
     items = [finding(n) for n in range(1, 30)] + [finding(1, pr=4068)]
     blocks = fv.render_blocks([f"{REPO}#4067", f"{REPO}#4068"], table(*items), {})
-    assert "#4068" in blocks[0]["text"]["text"]  # most recently linked first
+    assert fv.render_blocks([f"{REPO}#4068", f"{REPO}#4067"], table(*items), {})[0]["text"]["text"].startswith("<https://github.com/Org/Repo/pull/4068|*#4068")
+    assert "#4067" in blocks[0]["text"]["text"]  # in the order given
     assert any("more on #4067" in json.dumps(b) for b in blocks)
     assert len(blocks) <= fv._MAX_BLOCKS and blocks[-1]["type"] != "divider"
     assert fv.render_blocks([f"{REPO}#4067"], {}, {}) == []
@@ -87,6 +88,8 @@ def test_render_orders_prs_newest_first_caps_findings_and_blocks():
 class Fake(fv.SlackFindingsMixin):
     def __init__(self, live=(), known=("C1", "C2")):
         self.calls, self._live, self._known = [], set(live), set(known)
+        self._code_channels = {c: True for c in known}
+        self.stacks = {}  # channel -> [(number, current)]
         self._init_findings_state()
         self._native_task_card_streams = {i: types.SimpleNamespace(channel=c, stopped=False) for i, c in enumerate(live)}
         client = types.SimpleNamespace()
@@ -95,6 +98,10 @@ class Fake(fv.SlackFindingsMixin):
             self.calls.append((method, json))
         client.api_call = api_call
         self._client = client
+
+    async def _findings_stack(self, channel, force=False):
+        keys = [f"{REPO}#{n}" for n in self.stacks.get(channel, [])]
+        return keys, {k: {"title": "stack " + k, "url": "https://u"} for k in keys}
 
     def _is_known_code_channel(self, c):
         return c in self._known
@@ -156,6 +163,38 @@ def test_file_change_updates_linked_channels_only_and_skips_identical_views(monk
         f.write_text(json.dumps(table(finding(1, status="planned", note="fixed locally"), finding(1, pr=4068))) + " ")
         await a._findings_tick()
         assert len(a.calls) == n  # touched file, same content: no update
+        a._findings_offline()
+    asyncio.run(go())
+
+
+def test_channel_follows_its_branch_stack(monkeypatch, tmp_path):
+    async def go():
+        f = setup_files(monkeypatch, tmp_path, table(finding(1, pr=4068), finding(1, pr=4070)))
+        a = Fake()
+        a.stacks["C1"] = [4067, 4068]  # C1's branch is in a stack that includes 4068; nobody mentioned it
+        a._findings_online()
+        f.write_text(json.dumps(table(finding(1, pr=4068, note="stack finding"), finding(1, pr=4070))))
+        await a._findings_tick()
+        assert [c[1]["channel_id"] for c in a.calls] == ["C1"]
+        assert "stack finding" in json.dumps(a.calls[0][1]["blocks"])
+        assert "4070" not in json.dumps(a.calls[0][1]["blocks"])  # a PR outside the stack stays out
+        a._findings_offline()
+    asyncio.run(go())
+
+
+def test_branch_switch_republishes_without_a_file_change(monkeypatch, tmp_path):
+    async def go():
+        setup_files(monkeypatch, tmp_path, table(finding(1, pr=4068), finding(2, pr=4070)))
+        a = Fake()
+        a.stacks["C1"] = [4068]
+        a._findings_online()
+        await a._findings_refresh_stacks()
+        assert len(a.calls) == 1 and "Issue 1" in json.dumps(a.calls[0][1]["blocks"])
+        a.stacks["C1"] = [4070]  # the channel's branch changed
+        await a._findings_refresh_stacks()
+        assert len(a.calls) == 2 and "Issue 2" in json.dumps(a.calls[1][1]["blocks"])
+        await a._findings_refresh_stacks()
+        assert len(a.calls) == 2  # unchanged
         a._findings_offline()
     asyncio.run(go())
 

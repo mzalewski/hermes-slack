@@ -24,11 +24,17 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from . import pr_stack
+except ImportError:  # pragma: no cover - loaded outside a package
+    import pr_stack  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 VIEW_KEY = "hermes-findings"
 VIEW_NAME = "Findings"
 _POLL_SECONDS = 3.0
+_STACK_REFRESH = 60.0
 _MIN_PUBLISH_INTERVAL = 5.0
 _MAX_PRS_PER_CHANNEL = 10
 _MAX_FINDINGS_PER_PR = 8
@@ -194,13 +200,13 @@ def pr_short(pr: str) -> str:
 
 
 def render_blocks(prs: list[str], findings: dict, pr_info: dict[str, dict]) -> list[dict]:
-    """Blocks for the channel's PRs (newest linked first). PRs with no findings at all are skipped."""
+    """Blocks for the PRs, in the order given. PRs with no findings at all are skipped."""
     by_pr: dict[str, list[dict]] = {}
     for f in findings.values():
         if isinstance(f, dict) and f.get("pr") in prs:
             by_pr.setdefault(f["pr"], []).append(f)
     blocks: list[dict] = []
-    for pr in reversed(prs):
+    for pr in prs:
         items = by_pr.get(pr)
         if not items:
             continue
@@ -242,6 +248,20 @@ def blocks_digest(blocks: list[dict]) -> str:
     return hashlib.sha1(json.dumps(blocks, sort_keys=True).encode()).hexdigest()
 
 
+def profile_cwd(profile: Optional[str]) -> str:
+    """``terminal.cwd`` from a profile's config.yaml (the directory its terminal tool starts in)."""
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    name = (profile or "").strip()
+    path = home / "config.yaml" if name in ("", "default", "main") else home / "profiles" / name / "config.yaml"
+    try:
+        import yaml
+        cwd = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("terminal", {}).get("cwd", "")
+    except Exception:
+        return ""
+    cwd = os.path.expanduser(str(cwd or ""))
+    return cwd if cwd.startswith("/") else ""
+
+
 # ── adapter side ─────────────────────────────────────────────────────────────────────────────────────
 class SlackFindingsMixin:
     """Watches the findings file and keeps each linked Code channel's Findings tab current."""
@@ -253,6 +273,8 @@ class SlackFindingsMixin:
         self._findings_snap: dict[str, str] = {}
         self._findings_digest: dict[str, str] = {}
         self._findings_last: dict[str, float] = {}
+        self._findings_stacks: dict[str, tuple[float, list[str], dict]] = {}
+        self._findings_refresh_at = 0.0
 
     def _findings_online(self) -> None:
         if not findings_view_enabled() or self._findings_task is not None:
@@ -280,6 +302,8 @@ class SlackFindingsMixin:
             try:
                 await asyncio.sleep(_POLL_SECONDS)
                 await self._findings_tick()
+                if time.monotonic() - self._findings_refresh_at >= _STACK_REFRESH:
+                    await self._findings_refresh_stacks()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -292,6 +316,54 @@ class SlackFindingsMixin:
             if not getattr(stream, "stopped", True) and self._is_known_code_channel(stream.channel):
                 live.add(stream.channel)
         return live
+
+    def _code_channel_ids(self) -> list[str]:
+        return [c for c, v in getattr(self, "_code_channels", {}).items() if v is True]
+
+    # ── a channel's working directory, its branch's PR stack ──
+    def _findings_cwd(self, channel: str) -> str:
+        """Where this channel's work happens: the directory its Claude Code runs report, else the bot's
+        configured terminal directory."""
+        try:
+            try:
+                from .subagents import TRACKER
+            except ImportError:  # pragma: no cover
+                from subagents import TRACKER  # type: ignore
+            for rec in reversed(TRACKER.for_chat(channel)):
+                if getattr(rec, "cwd", ""):
+                    return rec.cwd
+        except Exception:
+            pass
+        return profile_cwd(getattr(self, "_owner_profile", None))
+
+    async def _findings_stack(self, channel: str, force: bool = False) -> tuple[list[str], dict]:
+        """``(PR keys in display order, {key: {title, url}})`` for the channel's current branch stack."""
+        hit = self._findings_stacks.get(channel)
+        if hit and not force and time.monotonic() - hit[0] < _STACK_REFRESH / 2:
+            return hit[1], hit[2]
+        repo, stack = await pr_stack.work_stack(self._findings_cwd(channel))
+        stack = sorted(stack, key=lambda p: (not p.get("current"), p["number"]))  # the branch's own PR first
+        keys = [pr_stack.pr_key(repo, p["number"]) for p in stack]
+        info = {pr_stack.pr_key(repo, p["number"]): {"title": p.get("title"), "url": p.get("url")} for p in stack}
+        self._findings_stacks[channel] = (time.monotonic(), keys, info)
+        return keys, info
+
+    async def _findings_prs_for(self, channel: str) -> tuple[list[str], dict]:
+        """The stack for the channel's branch first, then PRs mentioned or touched in the channel."""
+        keys, info = await self._findings_stack(channel)
+        extra = [p for p in reversed(self._findings_links.for_channel(channel) if self._findings_links else []) if p not in keys]
+        return keys + extra, info
+
+    async def _findings_refresh_stacks(self) -> None:
+        """Pick up a branch switch, a new stacked PR or a merged one without any file change."""
+        self._findings_refresh_at = time.monotonic()
+        findings = None
+        for channel in self._code_channel_ids():
+            before = (self._findings_stacks.get(channel) or (0, None))[1]
+            keys, _ = await self._findings_stack(channel, force=True)
+            if keys and keys != before:
+                findings = findings if findings is not None else load_json(findings_path())
+                await self._publish_findings_view(channel, findings)
 
     async def _findings_tick(self) -> None:
         links = self._findings_links
@@ -309,8 +381,9 @@ class SlackFindingsMixin:
             return
         for channel in self._live_run_channels():  # a run that is live while the file changes wrote it
             links.add(channel, sorted(touched))
-        for channel in links.channels_for(touched):
-            if self._is_known_code_channel(channel):
+        for channel in self._code_channel_ids():
+            prs, _ = await self._findings_prs_for(channel)
+            if touched.intersection(prs):
                 await self._publish_findings_view(channel, findings)
 
     def _findings_note_text(self, channel: str, text: str) -> None:
@@ -323,14 +396,14 @@ class SlackFindingsMixin:
             asyncio.ensure_future(self._publish_findings_view(channel))
 
     async def _publish_findings_view(self, channel: str, findings: Optional[dict] = None) -> None:
-        links = self._findings_links
-        if links is None:
+        if self._findings_links is None:
             return
         wait = _MIN_PUBLISH_INTERVAL - (time.monotonic() - self._findings_last.get(channel, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
         findings = findings if findings is not None else load_json(findings_path())
-        blocks = render_blocks(links.for_channel(channel), findings, load_prs())
+        prs, gh_info = await self._findings_prs_for(channel)
+        blocks = render_blocks(prs, findings, {**load_prs(), **gh_info})
         if not blocks:
             return
         digest = blocks_digest(blocks)
