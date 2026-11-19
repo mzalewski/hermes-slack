@@ -17,6 +17,11 @@ def code_channel_cards_enabled() -> bool:
     return os.getenv("SLACK_CODE_CHANNEL_TASK_CARDS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
+def code_channel_shared_session_enabled() -> bool:
+    """One shared session per Code channel (default) instead of one per participant."""
+    return os.getenv("SLACK_CODE_CHANNEL_SHARED_SESSION", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
 def code_channels_enabled() -> bool:
     return os.getenv("SLACK_CODE_CHANNELS", "true").strip().lower() not in ("0", "false", "no", "off")
 
@@ -34,6 +39,18 @@ class SlackCodeChannelMixin:
     # (``agents.sessions.setStatus`` without ``thread_ts``) and Slack sends ``agent_session_stopped``
     # for the Stop button. https://docs.slack.dev/ai/slack-code/
     _CODE_CHANNEL_ROOTS_MAX = 5000
+
+    def build_source(self, *args: Any, **kwargs: Any):
+        """A Code channel is one session shared by everyone in it. ``shared_session`` drops the
+        participant from the session key but keeps ``user_id`` (slash access checks) and labels each
+        message with its sender. DMs and other channels are untouched."""
+        source = super().build_source(*args, **kwargs)
+        chat_id = getattr(source, "chat_id", "")
+        if (getattr(source, "chat_type", "dm") != "dm" and code_channel_shared_session_enabled()
+                and self._is_known_code_channel(chat_id)):
+            import dataclasses
+            return dataclasses.replace(source, shared_session=True)
+        return source
 
     def _code_channel_cards_enabled(self) -> bool:
         return code_channel_cards_enabled()

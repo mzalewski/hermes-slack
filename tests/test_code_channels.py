@@ -148,3 +148,46 @@ def test_native_stop_disabled_flag(monkeypatch):
     a = Adapter(FakeClient())
     run(a._handle_agent_session_stopped({"channel": "C1", "user": "U1", "thread_ts": "1.0"}))
     assert a.slash == [] and a.handled == []
+
+
+# ── shared session per Code channel ─────────────────────────────────────────
+import dataclasses
+
+
+@dataclasses.dataclass
+class _Src:
+    chat_id: str
+    chat_type: str = "group"
+    user_id: str = "U1"
+    shared_session: bool = False
+
+
+class _Base:
+    def build_source(self, chat_id, chat_type="dm", user_id=None, **kw):
+        return _Src(chat_id=chat_id, chat_type=chat_type, user_id=user_id)
+
+
+class SharedAdapter(cc.SlackCodeChannelMixin, _Base):
+    def __init__(self):
+        self._init_code_channel_state()
+
+
+def test_code_channel_source_is_shared_and_keeps_user():
+    a = SharedAdapter()
+    a._code_channels["C1"] = True
+    src = a.build_source("C1", chat_type="group", user_id="U9")
+    assert src.shared_session is True and src.user_id == "U9"
+
+
+def test_non_code_channel_and_dm_not_shared():
+    a = SharedAdapter()
+    a._code_channels["C1"] = True
+    assert a.build_source("C2", chat_type="group", user_id="U1").shared_session is False
+    assert a.build_source("C1", chat_type="dm", user_id="U1").shared_session is False
+
+
+def test_shared_session_flag_off(monkeypatch):
+    monkeypatch.setenv("SLACK_CODE_CHANNEL_SHARED_SESSION", "false")
+    a = SharedAdapter()
+    a._code_channels["C1"] = True
+    assert a.build_source("C1", chat_type="group", user_id="U1").shared_session is False
