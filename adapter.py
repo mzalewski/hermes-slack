@@ -352,12 +352,6 @@ class _NativeTaskCardStream:
     heading_final: Optional[str] = None  # set when the card closes: its last heading
     superseded: bool = False  # another message landed below this card: later steps belong in a new card
     exclude_ids: set = field(default_factory=set)  # task ids already finished on an earlier card
-    closing_note: Optional[str] = None  # last line for a live row when the card closes; None = "Running in background", "" = none
-    log_cursor: dict = field(default_factory=dict)  # row id -> log lines already sent (Slack appends `details`)
-    cursor_next: dict = field(default_factory=dict)
-    log_started: set = field(default_factory=set)  # rows this card has already sent `details` for
-    started_next: set = field(default_factory=set)
-    closing: bool = False  # final frame: live subagent rows are handed off, not left in progress
     flush_task: Optional[Any] = None
 
 
@@ -2138,7 +2132,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         self, key: tuple[str, str, str], old: "_NativeTaskCardStream", tasks: list[dict[str, str]],
         title: str, metadata: Optional[dict[str, Any]]) -> Optional["_NativeTaskCardStream"]:
         """Another message was posted below ``old``. Close it, with each finished step as it ended and any
-        still-running step marked "continues below", and open a new card for what is still running or new.
+        still-running step shown complete, and open a new card for what is still running or new.
         Returns the new stream, or None when nothing is running (the old card just closes)."""
         async with old.lock:
             if old.stopped:
@@ -2156,8 +2150,6 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                     running_now.add(tid)
                     task["status"] = "complete"  # the next card shows it still running
                 final_old.append(task)
-            live_rows = self._live_subagent_rows(old)
-            old.closing, old.closing_note = True, ""
             old.heading_final = self._task_label(final_old[-1]) if final_old else None
             try:
                 await self._append_native_task_card(old, final_old, title, metadata)
@@ -2174,12 +2166,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                     self._native_task_card_streams.pop(key, None)
         carry = [t for t in tasks if str(t.get("id") or t.get("task_id") or "task") in running_now
                  or str(t.get("id") or t.get("task_id") or "task") not in old_ids]
-        if not (any((t.get("status") or "in_progress") == "in_progress" for t in carry) or live_rows):
+        if not any((t.get("status") or "in_progress") == "in_progress" for t in carry):
             return None
         new = _NativeTaskCardStream(team_id=key[0], channel=old.channel, thread_ts=old.thread_ts)
         # Finished steps stay on the card above; steps still running continue here.
         new.exclude_ids = (old.exclude_ids | old_ids) - running_now
-        new.log_cursor = {r.subagent_id: len(r.log) for r in live_rows}  # their history is already above
         self._native_task_card_streams[key] = new
         return new
 
@@ -2210,7 +2201,6 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                     chunk = self._task_update_chunk(task)
                     chunk["title"] = _friendly_title(chunk["title"])[:256]
                     out.append(chunk)
-                out.extend(self._subagent_task_chunks(stream))
                 return out, any(c["type"] == "task_update" for c in out)
 
             chunks, has_rows = build_chunks()
@@ -2235,14 +2225,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                     "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                     "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts or "(flat)")
                 stream.stream_ts = ""
-                stream.log_cursor.clear()  # the new message has no history: resend each row's whole log
-                stream.log_started.clear()
                 await self._start_native_task_card_stream(client, stream, metadata)
                 chunks, _ = build_chunks()
                 await client.api_call(
                     "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
-            stream.log_cursor.update(stream.cursor_next)
-            stream.log_started |= getattr(stream, "started_next", set())
             stream.last_sent = time.monotonic()
             return SendResult(success=True, message_id=stream.stream_ts)
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -2272,10 +2258,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                    if str(t.get("id") or t.get("task_id") or "task") not in stream.exclude_ids]
         return self._task_label(visible[-1]) if visible else ""
 
-    async def _close_cards_for_claude(self, chat_id: str, thread: str) -> None:
-        """A Claude Code stream just started below this chat's Hermes card. Finish that card now (its
+    async def _close_cards_for_run(self, chat_id: str, thread: str) -> None:
+        """A Claude Code or subagent stream just started below this chat's Hermes card. Finish that card now (its
         running steps shown complete) and remember what it showed, so Hermes's later steps open a NEW
-        card below Claude's instead of editing the one above it. Keeps the timeline in order."""
+        card below the new stream's instead of editing the one above it. Keeps the timeline in order."""
         for key, old in list(self._native_task_card_streams.items()):
             if old.channel != chat_id or old.stopped or not old.stream_ts or (old.thread_ts or "") != thread:
                 continue
@@ -2287,7 +2273,6 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                 old.pending = None
                 shown = [dict(t, status="complete" if (t.get("status") or "in_progress") == "in_progress" else t["status"])
                          for t in (old.last_tasks or [])]
-                old.closing, old.closing_note = True, ""
                 label = self._task_label(shown[-1]) if shown else ""
                 old.heading_final = label or None
                 try:
@@ -2354,15 +2339,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                 tasks, title, metadata = stream.pending
                 await self._append_native_task_card(stream, tasks, title, metadata)  # final frame
             if stream.stream_ts and stream.last_tasks is not None:
-                # Slack shows a closed card with unfinished tasks as "Something went wrong". Subagents
-                # (async delegation) often outlive the turn, so hand their rows off before closing.
-                live = bool(self._live_subagent_rows(stream))
                 last = self._last_card_label(stream)
-                if live:
-                    stream.closing = True
                 if last and os.getenv("SLACK_CARD_HEADING", "true").strip().lower() not in ("0", "false", "no", "off"):
                     stream.heading_final = f"Done · {last}"
-                if live or stream.heading_final:
                     await self._append_native_task_card(stream, stream.last_tasks, stream.last_title or "", stream.last_metadata)
             stream.stopped = True
             try:

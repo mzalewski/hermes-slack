@@ -148,19 +148,5 @@ def test_install_refuses_invalid_json_and_dry_run_writes_nothing(tmp_path):
 
 
 # ── card scoping ──
-class M(sa.SlackSubagentMixin):
-    def _is_known_code_channel(self, c):
-        return False
 
 
-def test_card_only_shows_runs_overlapping_its_lifetime(monkeypatch):
-    t = sa.SubagentTracker()
-    monkeypatch.setattr(sa, "TRACKER", t)
-    monkeypatch.setattr(sa, "_session_env", lambda: ("slack", "C1", ""))
-    base = time.time()
-    t.on_start(child_subagent_id="old", child_goal="yesterday", child_session_id="a", parent_session_id="p")
-    t.on_stop(child_session_id="a", child_status="completed")
-    t.get("old").ended = base - 400
-    t.on_start(child_subagent_id="new", child_goal="today", child_session_id="b", parent_session_id="p")
-    st = types.SimpleNamespace(channel="C1", thread_ts="", log_cursor={}, cursor_next={}, closing=False, created_wall=base - 10)
-    assert [r["title"] for r in M()._subagent_task_chunks(st)] == ["🔀 today"]

@@ -1,10 +1,13 @@
-"""Subagent monitoring and controls for Slack.
+"""Background runs on Slack: Hermes subagents and Claude Code, each in its own stream.
 
 Observation uses only public plugin hooks (``subagent_start``, ``subagent_stop``, ``pre_tool_call``,
 ``post_tool_call``, ``pre_llm_call``) plus ``gateway.session_context.get_session_env`` to learn which
-Slack chat a turn belongs to. Each tracked subagent is shown as an extra row on the adapter's native
-task card (quiet, throttled) and, in Code channels, in a "Subagents" view tab with Stop / Result
-buttons (updated only when a subagent starts or finishes, to avoid notification noise).
+Slack chat a turn belongs to. Claude Code runs reach us through events its own hooks write (see
+claude_code_hook.py). Every run is shown as its own Slack stream: a heading ("🔀 <goal>" /
+"🤖 Claude Code: <prompt>", then "· <its summary>" when done) with one row per step, below the Hermes card,
+updated every few seconds for the run's whole life (even after the Hermes turn that started it ends). When a
+run's stream starts, the earlier Hermes card is closed and later Hermes steps open a new card below it.
+Optionally, in Code channels, a "Subagents" view tab (off by default) carries Stop / Result buttons.
 
 Stop uses ``tools.delegate_tool_registry.interrupt_subagent``. That module is not on Hermes's public
 plugin API list, so it is imported lazily, guarded, and gated by ``SLACK_SUBAGENT_CONTROLS``.
@@ -72,7 +75,6 @@ class SubagentRecord:
     ended: float = 0.0
     summary: str = ""
     kind: str = "hermes"  # "hermes" (delegate_task child) | "claude" (Claude Code run launched by Hermes)
-    log: list = field(default_factory=list)  # one plain line per step; Slack appends `details`, so only new lines are sent
     steps: list = field(default_factory=list)  # Claude Code: one dict per tool call -> its own bullet row on the card
     open_calls: dict = field(default_factory=dict)  # Claude Code tool_use_id -> step dict, for calls with no result yet
     pid: int = 0  # Claude Code's process id (for a future per-run Stop)
@@ -104,19 +106,14 @@ def _arg_preview(args: Any) -> str:
     return ""
 
 
-def _closing_line(rec: "SubagentRecord") -> str:
-    secs = f" in {int(rec.ended - rec.started)}s" if rec.ended and rec.ended > rec.started else ""
-    return {"complete": f"✓ Done{secs}", "failed": f"✗ Failed{secs}", "interrupted": f"■ Stopped{secs}"}.get(rec.status, "")
-
-
 _MAX_STEP_ROWS = 30
-_CLAUDE_IDLE_CLOSE = 600.0
+_RUN_IDLE_CLOSE = {"claude": 600.0, "hermes": 1800.0}  # quiet this long: assume it died without a stop event
 
 
 @dataclass
-class _ClaudeCard:
-    """One Claude Code run's own Slack stream. Duck-typed to what the adapter's
-    ``_start_native_task_card_stream`` needs (channel, thread_ts, stream_ts)."""
+class _RunCard:
+    """One background run's (Claude Code or Hermes subagent) own Slack stream. Duck-typed to what the
+    adapter's ``_start_native_task_card_stream`` needs (channel, thread_ts, stream_ts)."""
 
     team_id: str
     channel: str
@@ -263,7 +260,9 @@ class SubagentTracker:
             rec.summary = str(kw.get("child_summary") or "")[:2000]
             duration_ms = kw.get("duration_ms")
             rec.ended = rec.started + duration_ms / 1000.0 if isinstance(duration_ms, (int, float)) and duration_ms > 0 else time.time()
-            rec.log.append(_closing_line(rec))
+            for step in rec.open_calls.values():  # a child stopped mid-call: close the row, never leave it running
+                step["status"], step["detail"] = ("complete", "") if rec.status == "complete" else ("error", "stopped")
+            rec.open_calls.clear()
         logger.info("[Slack] subagent %s finished: status=%s (raw=%r) tools=%d chat=%s", rec.subagent_id, rec.status,
                     kw.get("child_status"), rec.tool_count, rec.chat_id)
         self._notify(rec, "stop")
@@ -338,25 +337,41 @@ class SubagentTracker:
                 rec.status = "complete" if name == "Stop" else "interrupted"
                 rec.summary = str(ev.get("last_assistant_message") or rec.summary)[:2000]
                 rec.ended = t
-                rec.log.append(_closing_line(rec))
                 logger.info("[Slack] claude-code run %s finished: %s tools=%d chat=%s", rec.subagent_id, name, rec.tool_count, chat)
                 notify = "stop"
         if notify:
             self._notify(rec, notify)
 
+    def _hermes_record(self, kw: dict) -> Optional[SubagentRecord]:
+        rec = self._records.get(str(kw.get("task_id") or ""))
+        if rec is None:
+            rec = self._records.get(self._by_session.get(str(kw.get("session_id") or ""), ""))
+        return rec if rec is not None and rec.kind == "hermes" else None
+
     def on_tool(self, **kw: Any) -> None:
+        """A tool call by a delegate_task child (``task_id`` is the subagent id): one step row."""
         with self._lock:
-            sid = str(kw.get("task_id") or "")
-            rec = self._records.get(sid)
-            if rec is None:
-                rec = self._records.get(self._by_session.get(str(kw.get("session_id") or ""), ""))
+            rec = self._hermes_record(kw)
             if rec is None or not rec.live:
                 return
-            rec.tool_count += 1
             tool = str(kw.get("tool_name") or "tool")
             preview = _arg_preview(kw.get("args"))
             rec.last_tool = friendly_title(f"{tool} - {preview}" if preview else tool)
-            rec.log.append(rec.last_tool)
+            step = {"id": f"{rec.subagent_id}-{len(rec.steps) + 1}", "label": rec.last_tool, "status": "in_progress", "detail": ""}
+            rec.steps.append(step)
+            rec.open_calls[str(kw.get("tool_call_id") or step["id"])] = step
+            rec.tool_count += 1
+        self._notify(rec, "tool")
+
+    def on_tool_done(self, **kw: Any) -> None:
+        with self._lock:
+            rec = self._hermes_record(kw)
+            step = rec.open_calls.pop(str(kw.get("tool_call_id") or ""), None) if rec is not None else None
+            if step is None:
+                return
+            failed = str(kw.get("status") or "ok").lower() in ("error", "blocked", "cancelled")
+            step["status"] = "error" if failed else "complete"
+            step["detail"] = _short_error(kw.get("error_message")) if failed else ""
         self._notify(rec, "tool")
 
 
@@ -379,6 +394,7 @@ def register_hooks(ctx: Any) -> None:
     ctx.register_hook("subagent_start", guard(TRACKER.on_start))
     ctx.register_hook("subagent_stop", guard(TRACKER.on_stop))
     ctx.register_hook("pre_tool_call", guard(TRACKER.on_tool))
+    ctx.register_hook("post_tool_call", guard(TRACKER.on_tool_done))
 
 
 _ICONS = {"running": "⏳", "stopping": "⏹️", "complete": "✅", "failed": "❌", "interrupted": "⏹️"}
@@ -392,7 +408,7 @@ class SlackSubagentMixin:
         self._subagent_view_last: dict[str, float] = {}
         self._subagent_view_pending: dict[str, Any] = {}
         self._claude_poll_task: Optional[Any] = None
-        self._claude_cards: dict[str, "_ClaudeCard"] = {}  # run id -> its own stream
+        self._run_cards: dict[str, "_RunCard"] = {}  # run id -> its own stream
         self._carried_excludes: dict[Any, set] = {}  # card key -> task ids an earlier, closed card already showed
         TRACKER.attach(self)
 
@@ -405,28 +421,11 @@ class SlackSubagentMixin:
 
     async def _subagent_apply(self, rec: SubagentRecord, kind: str) -> None:
         try:
-            if rec.kind == "claude":
-                await self._claude_card_update(rec, kind)
-                return
-            await self._refresh_subagent_cards(rec)
+            await self._run_card_update(rec, kind)
             if kind in ("start", "stop"):
                 await self._publish_subagent_view(rec.chat_id)
         except Exception:
             logger.debug("[Slack] subagent update failed", exc_info=True)
-
-    # ── card rows ──
-    @staticmethod
-    def _rows_for(stream: Any) -> list[SubagentRecord]:
-        """Runs that overlapped this card's lifetime: still live, or finished after the card opened.
-        (Without this, every finished run in a channel would reappear on all later cards.)"""
-        opened = getattr(stream, "created_wall", 0.0) - 2.0
-        return [r for r in TRACKER.for_chat(stream.channel, stream.thread_ts, flat=not stream.thread_ts)
-                if r.kind != "claude" and (r.live or r.ended >= opened)]
-
-    def _live_subagent_rows(self, stream: Any) -> list[SubagentRecord]:
-        if not subagent_panel_enabled():
-            return []
-        return [r for r in self._rows_for(stream) if r.live and r.kind != "claude"]
 
     # ── Claude Code events ──
     def _ensure_claude_poller(self) -> None:
@@ -454,84 +453,44 @@ class SlackSubagentMixin:
                 reader.poll()
             except Exception:
                 logger.debug("[Slack] claude-code poll failed", exc_info=True)
-            await self._close_quiet_claude_cards()
-            idle = 0 if (self._native_task_card_streams or self._claude_cards) else idle + 1
+            await self._close_quiet_run_cards()
+            idle = 0 if (self._native_task_card_streams or self._run_cards) else idle + 1
             if idle > 30:  # no card open for 30s: nothing to render
                 return
             await asyncio.sleep(1.0)
 
-    def _subagent_task_chunks(self, stream: Any) -> list[dict[str, Any]]:
-        """One ``task_update`` row per tracked run. Slack APPENDS ``details`` across updates, so a row's
-        ``details`` carries only the log lines this card hasn't been sent yet (``stream.log_cursor``);
-        the cursor is committed by the caller after a successful send (``stream.cursor_next``)."""
-        stream.cursor_next = {}
-        stream.started_next = set()
-        started = getattr(stream, "log_started", None)
-        if started is None:  # plain stand-in objects: infer from the cursor
-            started = {k for k, v in stream.log_cursor.items() if v}
-        if not subagent_panel_enabled():
-            return []
-        recs = self._rows_for(stream)[-6:]
-        closing = getattr(stream, "closing", False)
-        chunks = []
-        for rec in recs:
-            lines = list(rec.log)
-            status = {"complete": "complete", "failed": "error", "interrupted": "error"}.get(rec.status, "in_progress")
-            if rec.live and closing:
-                # The card is closing but the run keeps going: never leave a row in progress.
-                status = "complete"
-                note = getattr(stream, "closing_note", None)
-                note = "Running in background" if note is None else note  # "" = say nothing (handover: the next card continues it)
-                if note:
-                    lines.append("↪ " + note)
-            elif rec.live and rec.status == "stopping":
-                lines.append("⏹ Stopping…")
-            sent = stream.log_cursor.get(rec.subagent_id, 0)
-            fresh = lines[sent:]
-            stream.cursor_next[rec.subagent_id] = len(lines)
-            title = f"🔀 {rec.goal or 'Subagent'}"
-            chunk = {"type": "task_update", "id": f"sub-{rec.subagent_id}"[:64], "title": title[:120], "status": status}
-            if fresh:
-                # Slack appends `details`: a row's first lines on THIS card start clean, later ones on a new line.
-                chunk["details"] = ("\n" if rec.subagent_id in started else "") + "\n".join(fresh)
-                stream.started_next.add(rec.subagent_id)
-            chunks.append(chunk)
-        return chunks
-
-    async def _refresh_subagent_cards(self, rec: SubagentRecord) -> None:
-        for stream in list(self._native_task_card_streams.values()):
-            if (stream.channel == rec.chat_id and not stream.stopped and stream.stream_ts and stream.last_tasks
-                    and (not stream.thread_ts or stream.thread_ts == rec.thread_ts)):
-                await self.send_native_task_card_progress(
-                    stream.channel, stream.last_tasks, title=stream.last_title,
-                    reply_to=stream.last_reply_to, metadata=stream.last_metadata)
-
-    # ── Claude Code's own stream ──
-    # Slack gives one heading per stream, so a Claude Code run gets its own stream (message) with its own
-    # heading and steps, below the Hermes card. Once it starts, the earlier Hermes card is closed and later
-    # Hermes steps open a new card below it, which keeps the timeline in order.
-    def _claude_card_thread(self, rec: SubagentRecord) -> Optional[str]:
+    # ── a stream per background run (Claude Code or a Hermes subagent) ──
+    # Slack gives one heading per stream, so each run gets its own stream (message) with its own heading
+    # and steps, below the Hermes card. Once it starts, the earlier Hermes card is closed and later Hermes
+    # steps open a new card below it, which keeps the timeline in order. The stream follows the run for
+    # its whole life, including after the Hermes turn that started it has ended (async delegation).
+    def _run_card_thread(self, rec: SubagentRecord) -> Optional[str]:
         """"" = flat Code-channel card, a ts = thread card, None = nowhere to anchor a card."""
         if self._is_known_code_channel(rec.chat_id) and (
                 not rec.thread_ts or self._code_channel_reply_is_flat(None, {"thread_id": rec.thread_ts})):
             return ""
         return rec.thread_ts or None
 
-    def _claude_team(self, chat_id: str) -> str:
+    def _run_team(self, chat_id: str) -> str:
         return next((s.team_id for s in self._native_task_card_streams.values() if s.channel == chat_id), "")
 
     @staticmethod
-    def _claude_heading(rec: SubagentRecord, final: bool) -> str:
-        base = "🤖 Claude Code"
+    def _run_heading(rec: SubagentRecord, final: bool) -> str:
+        """While running: "🤖 Claude Code: <prompt>" / "🔀 <goal>". Closed: "· <first sentence of its own
+        summary>", or "Stopped" / "Failed"."""
+        claude = rec.kind == "claude"
+        base = "🤖 Claude Code" if claude else "🔀 Subagent"
         if not final:
-            return f"{base}: {_short_title(rec.goal)}" if rec.goal else base
-        if rec.status == "interrupted":
-            return f"{base} · Stopped"
-        summary = _short_title(rec.summary, 70) or (rec.steps[-1]["label"] if rec.steps else "Done")
-        return f"{base} · {summary}"
+            goal = _short_title(rec.goal)
+            if claude:
+                return f"{base}: {goal}" if goal else base
+            return f"🔀 {goal}" if goal else base
+        suffix = {"interrupted": "Stopped", "failed": "Failed"}.get(rec.status) or (
+            _short_title(rec.summary, 70) or (rec.steps[-1]["label"] if rec.steps else "Done"))
+        return f"{base} · {suffix}"
 
-    def _claude_chunks(self, rec: SubagentRecord, final: bool = False) -> list[dict[str, Any]]:
-        chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": self._claude_heading(rec, final)[:256]}]
+    def _run_chunks(self, rec: SubagentRecord, final: bool = False) -> list[dict[str, Any]]:
+        chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": self._run_heading(rec, final)[:256]}]
         for step in rec.steps[-_MAX_STEP_ROWS:]:
             status = {"complete": "complete", "error": "error"}.get(step["status"], "in_progress")
             if final and status == "in_progress":
@@ -540,12 +499,12 @@ class SlackSubagentMixin:
             chunks.append({"type": "task_update", "id": _step_row_id(step), "title": label[:120], "status": status})
         return chunks
 
-    async def _claude_send(self, card: "_ClaudeCard", rec: SubagentRecord, final: bool) -> None:
+    async def _run_send(self, card: "_RunCard", rec: SubagentRecord, final: bool) -> None:
         try:
             client = self._get_client(card.channel, team_id=card.team_id or None)
             if not card.stream_ts:
                 await self._start_native_task_card_stream(client, card, None)
-            payload = {"channel": card.channel, "ts": card.stream_ts, "chunks": self._claude_chunks(rec, final)}
+            payload = {"channel": card.channel, "ts": card.stream_ts, "chunks": self._run_chunks(rec, final)}
             try:
                 await client.api_call("chat.appendStream", json=payload)
             except Exception as exc:
@@ -559,20 +518,20 @@ class SlackSubagentMixin:
         except Exception:
             logger.warning("[Slack] claude-code card update failed", exc_info=True)
 
-    async def _claude_card_update(self, rec: SubagentRecord, kind: str) -> None:
+    async def _run_card_update(self, rec: SubagentRecord, kind: str) -> None:
         final = kind == "stop"
         if not rec.steps and not final:
             return
-        thread = self._claude_card_thread(rec)
+        thread = self._run_card_thread(rec)
         if thread is None:
             return
-        card = self._claude_cards.get(rec.subagent_id)
+        card = self._run_cards.get(rec.subagent_id)
         created = False
         if card is None:
             if not rec.steps:
                 return
-            card = _ClaudeCard(team_id=self._claude_team(rec.chat_id), channel=rec.chat_id, thread_ts=thread)
-            self._claude_cards[rec.subagent_id] = card
+            card = _RunCard(team_id=self._run_team(rec.chat_id), channel=rec.chat_id, thread_ts=thread)
+            self._run_cards[rec.subagent_id] = card
             created = True
         card.last_event = time.monotonic()
         async with card.lock:
@@ -582,17 +541,17 @@ class SlackSubagentMixin:
             if not final and card.stream_ts and wait > 0:
                 card.pending = True  # coalesce: the next flush sends every step as it is by then
                 if card.flush_task is None or card.flush_task.done():
-                    card.flush_task = asyncio.ensure_future(self._claude_flush_later(rec, card, wait))
+                    card.flush_task = asyncio.ensure_future(self._run_flush_later(rec, card, wait))
                 return
             card.pending = False
-            await self._claude_send(card, rec, final)
+            await self._run_send(card, rec, final)
             if created and card.stream_ts:
-                await self._close_cards_for_claude(rec.chat_id, thread)
+                await self._close_cards_for_run(rec.chat_id, thread)
             if final:
                 if card.flush_task is not None and not card.flush_task.done():
                     card.flush_task.cancel()
                 card.stopped = True
-                self._claude_cards.pop(rec.subagent_id, None)
+                self._run_cards.pop(rec.subagent_id, None)
                 try:
                     if card.stream_ts:
                         await self._get_client(card.channel, team_id=card.team_id or None).api_call(
@@ -600,22 +559,22 @@ class SlackSubagentMixin:
                 except Exception:
                     logger.debug("[Slack] claude-code stopStream failed", exc_info=True)
 
-    async def _claude_flush_later(self, rec: SubagentRecord, card: "_ClaudeCard", delay: float) -> None:
+    async def _run_flush_later(self, rec: SubagentRecord, card: "_RunCard", delay: float) -> None:
         await asyncio.sleep(delay)
         async with card.lock:
             if card.stopped or not card.pending:
                 return
             card.pending = False
-            await self._claude_send(card, rec, False)
+            await self._run_send(card, rec, False)
 
-    async def _close_quiet_claude_cards(self) -> None:
-        """A killed run never sends Stop/SessionEnd: close its card after 10 quiet minutes."""
-        for run_id, card in list(self._claude_cards.items()):
-            if time.monotonic() - card.last_event < _CLAUDE_IDLE_CLOSE:
-                continue
+    async def _close_quiet_run_cards(self) -> None:
+        """A killed run never sends its stop event: close its card once it has been quiet for long enough."""
+        for run_id, card in list(self._run_cards.items()):
             rec = TRACKER.get(run_id)
             if rec is None:
-                self._claude_cards.pop(run_id, None)
+                self._run_cards.pop(run_id, None)
+                continue
+            if time.monotonic() - card.last_event < _RUN_IDLE_CLOSE.get(rec.kind, 600.0):
                 continue
             with TRACKER._lock:
                 if rec.live:
@@ -623,7 +582,7 @@ class SlackSubagentMixin:
                     for step in rec.open_calls.values():
                         step["status"], step["detail"] = "error", "not run"
                     rec.open_calls.clear()
-            await self._claude_card_update(rec, "stop")
+            await self._run_card_update(rec, "stop")
 
     # ── view tab (Code channels) ──
     def _subagent_view_blocks(self, chat_id: str) -> list[dict[str, Any]]:

@@ -189,32 +189,6 @@ def test_result_button_shows_summary_privately(monkeypatch):
     assert (chat, user) == ("C1", "U5") and "Found 3 issues" in text
 
 
-def test_card_rows_per_flat_and_thread_streams(monkeypatch):
-    t = tracker(monkeypatch)
-    slack_env(monkeypatch, chat="C1", thread="1.0")
-    start(t)
-    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "a.py"})
-    m = Mixin()
-    S = lambda ch, th: types.SimpleNamespace(channel=ch, thread_ts=th, log_cursor={}, cursor_next={})
-    flat, mine, other_thread, other_chat = S("C1", ""), S("C1", "1.0"), S("C1", "2.0"), S("C2", "")
-    row = m._subagent_task_chunks(flat)[0]
-    assert row["id"] == "sub-s1" and row["status"] == "in_progress" and row["details"] == "Opening a.py"
-    assert len(m._subagent_task_chunks(mine)) == 1
-    assert m._subagent_task_chunks(other_thread) == [] and m._subagent_task_chunks(other_chat) == []
-
-
-def test_panel_flag_disables_rows_and_hooks(monkeypatch):
-    t = tracker(monkeypatch)
-    slack_env(monkeypatch)
-    start(t)
-    monkeypatch.setenv("SLACK_SUBAGENT_PANEL", "false")
-    assert Mixin()._subagent_task_chunks(types.SimpleNamespace(channel="C1", thread_ts="", log_cursor={}, cursor_next={})) == []
-    registered = {}
-    ctx = types.SimpleNamespace(register_hook=lambda name, fn, **k: registered.setdefault(name, fn))
-    sa.register_hooks(ctx)
-    assert set(registered) == {"pre_llm_call", "subagent_start", "subagent_stop", "pre_tool_call"}
-    registered["subagent_start"](child_subagent_id="zz", child_goal="x")  # disabled: no record
-    assert t.get("zz") is None
 
 
 # ── details are appended by Slack: send only new lines ───────────────────────
@@ -222,41 +196,7 @@ def S(ch="C1", th=""):
     return types.SimpleNamespace(channel=ch, thread_ts=th, log_cursor={}, cursor_next={}, closing=False)
 
 
-def test_details_send_only_new_lines_with_leading_newline(monkeypatch):
-    t = tracker(monkeypatch)
-    slack_env(monkeypatch)
-    start(t)
-    m, st = Mixin(), S()
-    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "a.py"})
-    first = m._subagent_task_chunks(st)[0]
-    assert first["details"] == "Opening a.py"
-    st.log_cursor.update(st.cursor_next)  # the caller commits after a successful send
-    assert "details" not in m._subagent_task_chunks(st)[0]  # nothing new: status-only update
-    t.on_tool(task_id="s1", tool_name="terminal", args={"command": "pytest"})
-    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "b.py"})
-    second = m._subagent_task_chunks(st)[0]
-    assert second["details"] == "\nRunning pytest\nOpening b.py"  # starts with \n so it lands on its own line
 
-
-def test_cursor_not_advanced_until_committed(monkeypatch):
-    t = tracker(monkeypatch)
-    slack_env(monkeypatch)
-    start(t)
-    m, st = Mixin(), S()
-    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "a.py"})
-    m._subagent_task_chunks(st)
-    again = m._subagent_task_chunks(st)  # the send failed, so the line must go out again
-    assert again[0]["details"] == "Opening a.py"
-
-
-def test_closing_hands_off_live_row_once(monkeypatch):
-    t = tracker(monkeypatch)
-    slack_env(monkeypatch)
-    start(t)
-    m, st = Mixin(), S()
-    st.closing = True
-    row = m._subagent_task_chunks(st)[0]
-    assert row["status"] == "complete" and "background" in row["details"]
 
 
 # ── Claude Code runs listed as subagents ─────────────────────────────────────
@@ -272,7 +212,7 @@ def test_claude_run_lifecycle_and_its_own_stream_chunks(monkeypatch):
     cc(t, "PostToolUse", tool_name="Read", tool_use_id="u1", ts=102)
     cc(t, "PreToolUse", tool_name="Edit", tool_use_id="u2", tool_input={"file_path": "/repo/calc.py"}, ts=103)
     rec = t.for_chat("C1")[0]
-    running = Mixin()._claude_chunks(rec)
+    running = Mixin()._run_chunks(rec)
     assert running[0] == {"type": "plan_update", "title": "🤖 Claude Code: fix the add bug"}
     assert [(c["title"], c["status"]) for c in running[1:]] == [("Reading calc.py", "complete"), ("Editing calc.py", "in_progress")]
     cc(t, "PostToolUseFailure", tool_name="Edit", tool_use_id="u2", error="old_string not found", ts=104)
@@ -280,11 +220,10 @@ def test_claude_run_lifecycle_and_its_own_stream_chunks(monkeypatch):
     assert rec.kind == "claude" and rec.status == "complete" and rec.summary.startswith("Fixed it.")
     assert [(s["label"], s["status"], s["detail"]) for s in rec.steps] == [
         ("Reading calc.py", "complete", ""), ("Editing calc.py", "error", "old_string not found")]
-    done = Mixin()._claude_chunks(rec, final=True)
+    done = Mixin()._run_chunks(rec, final=True)
     assert done[0]["title"] == "🤖 Claude Code · Fixed it."  # first sentence of Claude's own summary
     assert [(c["title"], c["status"]) for c in done[1:]] == [
         ("Reading calc.py", "complete"), ("Editing calc.py · old_string not found", "error")]
-    assert Mixin()._subagent_task_chunks(S()) == []  # Claude runs never appear on the Hermes card
 
 
 def test_claude_denied_call_is_closed_as_not_run_on_stop(monkeypatch):
@@ -307,7 +246,7 @@ def test_claude_killed_run_closes_on_session_end_as_interrupted(monkeypatch):
 def test_claude_events_without_prompt_still_tracked_and_heading_has_prefix(monkeypatch):
     t = tracker(monkeypatch)
     cc(t, "PreToolUse", tool_name="Grep", tool_use_id="u1", tool_input={"pattern": "TODO"}, ts=100)
-    chunks = Mixin()._claude_chunks(t.for_chat("C1")[0])
+    chunks = Mixin()._run_chunks(t.for_chat("C1")[0])
     assert chunks[0]["title"] == "🤖 Claude Code" and chunks[1]["title"] == "Searching TODO"
 
 
@@ -315,7 +254,7 @@ def test_killed_run_heading_says_stopped(monkeypatch):
     t = tracker(monkeypatch)
     cc(t, "UserPromptSubmit", prompt="x", ts=100)
     cc(t, "SessionEnd", ts=101)
-    assert Mixin()._claude_chunks(t.for_chat("C1")[0], final=True)[0]["title"] == "🤖 Claude Code · Stopped"
+    assert Mixin()._run_chunks(t.for_chat("C1")[0], final=True)[0]["title"] == "🤖 Claude Code · Stopped"
 
 
 def test_claude_second_prompt_in_same_session_is_a_new_row_and_chats_isolated(monkeypatch):
@@ -338,3 +277,57 @@ def test_polish_title_error_and_paths(monkeypatch):
     assert sa._claude_preview({"command": "node /home/me/dev/test1/test.js"}, "/home/me/dev/test1") == "node test.js"
     assert sa._claude_preview({"file_path": "/home/me/dev/test1/src/a.py"}, "/home/me/dev/test1") == "src/a.py"
     assert sa._claude_preview({"command": "ls /etc"}, "/home/me/dev/test1") == "ls /etc"  # other paths untouched
+
+
+# ── Hermes subagents: a stream per child, like Claude Code ───────────────────
+def test_hermes_subagent_steps_and_stream_chunks(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    start(t, goal="Count the Python files under ~/.hermes/plugins")
+    t.on_tool(task_id="s1", tool_call_id="c1", tool_name="terminal", args={"command": "find . -name '*.py' | wc -l"})
+    rec = t.get("s1")
+    running = Mixin()._run_chunks(rec)
+    assert running[0] == {"type": "plan_update", "title": "🔀 Count the Python files under ~/.hermes/plugins"}
+    assert [(c["title"], c["status"]) for c in running[1:]] == [("Running find . -name '*.py' | wc -l", "in_progress")]
+    t.on_tool_done(task_id="s1", tool_call_id="c1", tool_name="terminal", status="ok")
+    t.on_tool(task_id="s1", tool_call_id="c2", tool_name="read_file", args={"path": "a.py"})
+    t.on_tool_done(task_id="s1", tool_call_id="c2", status="error", error_message="Exit code 1\n. .. x")
+    t.on_stop(child_session_id="cs1", child_status="completed", child_summary="There are 42 Python files. Listed by folder.")
+    done = Mixin()._run_chunks(rec, final=True)
+    assert done[0]["title"] == "🔀 Subagent · There are 42 Python files."  # first sentence of its own summary
+    assert [(c["title"].split(" | ")[0], c["status"]) for c in done[1:]] == [
+        ("Running find . -name '*.py'", "complete"), ("Opening a.py · Exit code 1", "error")]
+
+
+def test_hermes_subagent_stopped_or_failed_headings_and_open_calls_closed(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    start(t, sid="a", session="ca", goal="one")
+    start(t, sid="b", session="cb", goal="two")
+    t.on_tool(task_id="a", tool_call_id="x", tool_name="terminal", args={"command": "sleep 99"})
+    t.on_stop(child_session_id="ca", child_status="interrupted")
+    t.on_stop(child_session_id="cb", child_status="failed")
+    a, b = Mixin()._run_chunks(t.get("a"), final=True), Mixin()._run_chunks(t.get("b"), final=True)
+    assert a[0]["title"] == "🔀 Subagent · Stopped" and (a[1]["status"], "stopped" in a[1]["title"]) == ("error", True)
+    assert b[0]["title"] == "🔀 Subagent · Failed"
+
+
+def test_hermes_tool_events_for_other_agents_are_ignored(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    start(t)
+    t.on_tool(task_id="parent", session_id="parent-sess", tool_call_id="p1", tool_name="delegate_task", args={})
+    t.on_tool_done(task_id="parent", tool_call_id="p1", status="ok")
+    assert t.get("s1").steps == [] and t.get("s1").tool_count == 0
+
+
+def test_hooks_registered_and_the_panel_flag_disables_them(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    monkeypatch.setenv("SLACK_SUBAGENT_PANEL", "false")
+    registered = {}
+    ctx = types.SimpleNamespace(register_hook=lambda name, fn, **k: registered.setdefault(name, fn))
+    sa.register_hooks(ctx)
+    assert set(registered) == {"pre_llm_call", "subagent_start", "subagent_stop", "pre_tool_call", "post_tool_call"}
+    registered["subagent_start"](child_subagent_id="zz", child_goal="x")  # disabled: no record
+    assert t.get("zz") is None

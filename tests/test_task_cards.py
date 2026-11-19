@@ -156,51 +156,92 @@ def test_friendly_titles(mod):
     assert f("mystery_tool - x") == "mystery_tool - x"
 
 
-# ── Hermes subagent rows ─────────────────────────────────────────────────────
-def test_subagent_rows_appear_on_card_and_refresh_pushes_them(mod):
+# ── Hermes subagents: a stream per child, following it after the parent turn ends ─
+def subagent_env(mod):
     sa = subagents_mod(mod)
     tracker, orig_t, orig_e = sa.SubagentTracker(), sa.TRACKER, sa._session_env
     sa.TRACKER = tracker
     sa._session_env = lambda: ("slack", "C1", "")
+    return sa, tracker, (orig_t, orig_e)
+
+
+def test_subagent_gets_its_own_stream_and_keeps_going_after_the_parent_turn_ends(mod):
+    sa, tracker, (orig_t, orig_e) = subagent_env(mod)
     try:
         async def go():
             a = make(mod, interval=0)
-            await a.send_native_task_card_progress("C1", [task(1)], metadata={})
-            tracker.on_start(child_subagent_id="s1", child_goal="Audit token expiry", child_session_id="cs1", parent_session_id="p1")
-            tracker.on_tool(task_id="s1", tool_name="read_file", args={"path": "auth.py"})
-            await a._subagent_apply(tracker.get("s1"), "tool")
-            last = appends(a)[-1][1]["chunks"]
-            rows = [c for c in last if c.get("id", "").startswith("sub-")]
-            assert len(rows) == 1 and rows[0]["title"].startswith("🔀 Audit token expiry") and rows[0]["details"] == "Opening auth.py"
-            assert tasks_of(appends(a)[-1])[0]["title"] == "Opening f1.py"  # core's own task keeps its plain-language title
-            tracker.on_stop(child_session_id="cs1", child_status="completed", child_summary="done")
-            await a._subagent_apply(tracker.get("s1"), "stop")
-            last = appends(a)[-1][1]["chunks"]
-            assert [c for c in last if c.get("id", "").startswith("sub-")][0]["status"] == "complete"
+            rec = lambda: tracker.get("s1")
+            # the parent turn dispatches an async delegation, then its card closes
+            await a.send_native_task_card_progress("C1", [task(1, title="delegate_task - 1 task")], metadata={})
+            tracker.on_start(child_subagent_id="s1", child_goal="Count Python files. Recursively.", child_session_id="cs1", parent_session_id="p1")
+            await a._subagent_apply(rec(), "start")
+            assert methods(a) == ["chat.startStream", "chat.appendStream"]  # no steps yet: no stream yet
+            tracker.on_tool(task_id="s1", tool_call_id="c1", tool_name="terminal", args={"command": "find . -name '*.py'"})
+            await a._subagent_apply(rec(), "tool")
+            # the child's own stream opened below the Hermes card; the Hermes card was finished and closed
+            assert methods(a) == ["chat.startStream", "chat.appendStream", "chat.startStream", "chat.appendStream",
+                                  "chat.appendStream", "chat.stopStream"]
+            child_first = appends(a)[1]
+            assert child_first[1]["ts"] == "100.2" and heading_of(child_first) == "🔀 Count Python files."
+            assert a.client.calls[-1][1]["ts"] == "100.1"
+            await a.stop_native_task_card_progress("C1", metadata={})  # parent turn ends: nothing left to close
+            assert methods(a).count("chat.stopStream") == 1
+            # the child carries on AFTER the parent turn: its stream keeps updating until it finishes
+            tracker.on_tool_done(task_id="s1", tool_call_id="c1", status="ok")
+            tracker.on_tool(task_id="s1", tool_call_id="c2", tool_name="terminal", args={"command": "wc -l"})
+            await a._subagent_apply(rec(), "tool")
+            call = appends(a)[-1]
+            assert call[1]["ts"] == "100.2" and [(c["title"], c["status"]) for c in tasks_of(call)] == [
+                ("Running find . -name '*.py'", "complete"), ("Running wc -l", "in_progress")]
+            tracker.on_tool_done(task_id="s1", tool_call_id="c2", status="ok")
+            tracker.on_stop(child_session_id="cs1", child_status="completed", child_summary="There are 42 Python files.")
+            await a._subagent_apply(rec(), "stop")
+            final = appends(a)[-1]
+            assert final[1]["ts"] == "100.2" and heading_of(final) == "🔀 Subagent · There are 42 Python files."
+            assert all(c["status"] == "complete" for c in tasks_of(final))
+            assert a.client.calls[-1][0] == "chat.stopStream" and a.client.calls[-1][1]["ts"] == "100.2" and not a._run_cards
+            # the parent's next steps (e.g. reading the delegation result) open a NEW card below
+            await a.send_native_task_card_progress("C1", [task(1, "complete", "delegate_task - 1 task"), task(2, title="terminal - echo done")], metadata={})
+            new = appends(a)[-1]
+            assert new[1]["ts"] == "100.3" and [c["title"] for c in tasks_of(new)] == ["Running echo done"]
         run(go())
     finally:
         sa.TRACKER, sa._session_env = orig_t, orig_e
 
 
-def test_card_close_hands_off_running_subagent_rows(mod):
-    sa = subagents_mod(mod)
-    tracker, orig_t, orig_e = sa.SubagentTracker(), sa.TRACKER, sa._session_env
-    sa.TRACKER = tracker
-    sa._session_env = lambda: ("slack", "C1", "")
+def test_parallel_subagents_each_get_a_stream_and_the_hermes_card_closes_once(mod):
+    sa, tracker, (orig_t, orig_e) = subagent_env(mod)
     try:
         async def go():
             a = make(mod, interval=0)
-            await a.send_native_task_card_progress("C1", [task(1, "complete")], metadata={})
-            tracker.on_start(child_subagent_id="s1", child_goal="Count files", child_session_id="cs1", parent_session_id="p1")
-            await a._subagent_apply(tracker.get("s1"), "start")
-            mid = appends(a)[-1][1]["chunks"]
-            assert [c for c in mid if c.get("id") == "sub-s1"][0]["status"] == "in_progress" and "details" not in mid[-1]
-            await a.stop_native_task_card_progress("C1", metadata={})
-            assert methods(a)[-1] == "chat.stopStream"
-            final = appends(a)[-1][1]["chunks"]
-            row = [c for c in final if c.get("id") == "sub-s1"][0]
-            assert row["status"] == "complete" and "background" in row["details"]
-            assert not any(c.get("status") == "in_progress" for c in final)  # nothing left open at close
+            await a.send_native_task_card_progress("C1", [task(1, title="delegate_task - 2 tasks")], metadata={})
+            for sid, goal in (("s1", "Count files"), ("s2", "List folders")):
+                tracker.on_start(child_subagent_id=sid, child_goal=goal, child_session_id=f"c{sid}", parent_session_id="p1")
+                tracker.on_tool(task_id=sid, tool_call_id=f"{sid}-1", tool_name="terminal", args={"command": "ls"})
+                await a._subagent_apply(tracker.get(sid), "tool")
+            starts = [c for c in a.client.calls if c[0] == "chat.startStream"]
+            assert len(starts) == 3  # Hermes card + one per child
+            headings = {c[1]["ts"]: heading_of(c) for c in appends(a) if c[1]["ts"] in ("100.2", "100.3")}
+            assert headings == {"100.2": "🔀 Count files", "100.3": "🔀 List folders"}
+            assert methods(a).count("chat.stopStream") == 1  # the Hermes card closed once, at the first child's stream
+        run(go())
+    finally:
+        sa.TRACKER, sa._session_env = orig_t, orig_e
+
+
+def test_a_quiet_run_is_closed_by_the_watchdog(mod):
+    sa, tracker, (orig_t, orig_e) = subagent_env(mod)
+    try:
+        async def go():
+            a = make(mod, interval=0)
+            tracker.on_start(child_subagent_id="s1", child_goal="Stuck", child_session_id="cs1", parent_session_id="p1")
+            tracker.on_tool(task_id="s1", tool_call_id="c1", tool_name="terminal", args={"command": "sleep 9999"})
+            await a._subagent_apply(tracker.get("s1"), "tool")
+            card = a._run_cards["s1"]
+            card.last_event -= 3600  # quiet for an hour: no stop event ever came
+            await a._close_quiet_run_cards()
+            assert not a._run_cards and heading_of(appends(a)[-1]) == "🔀 Subagent · Stopped"
+            assert a.client.calls[-1][0] == "chat.stopStream"
         run(go())
     finally:
         sa.TRACKER, sa._session_env = orig_t, orig_e
@@ -354,7 +395,7 @@ def test_claude_steps_denied_calls_and_a_killed_run(mod):
             final = appends(a)[-1]
             assert heading_of(final) == "🤖 Claude Code · Stopped"
             assert [(c["title"], c["status"]) for c in tasks_of(final)] == [("Running pytest -q · not run", "error")]
-            assert a.client.calls[-1][0] == "chat.stopStream" and not a._claude_cards
+            assert a.client.calls[-1][0] == "chat.stopStream" and not a._run_cards
         run(go())
     finally:
         sa.TRACKER = orig
