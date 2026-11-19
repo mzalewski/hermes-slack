@@ -40,7 +40,7 @@ _MAX_PRS_PER_CHANNEL = 10
 _MAX_FINDINGS_PER_PR = 8
 _MAX_BLOCKS = 45
 _ACTIONABLE = ("open", "planned")
-_STATUS_ICON = {"open": "🔴", "planned": "🛠️"}
+_STATUS_ICON = {"open": "🔴", "planned": "🛠️", "rejected": "⚪", "wont_fix": "⚪"}
 
 
 def findings_view_enabled() -> bool:
@@ -199,7 +199,8 @@ def pr_short(pr: str) -> str:
     return "#" + pr.rsplit("#", 1)[-1]
 
 
-def render_blocks(prs: list[str], findings: dict, pr_info: dict[str, dict]) -> list[dict]:
+def render_blocks(prs: list[str], findings: dict, pr_info: dict[str, dict], *, include_closed: bool = False,
+                  limit: int = _MAX_FINDINGS_PER_PR) -> list[dict]:
     """Blocks for the PRs, in the order given. PRs with no findings at all are skipped."""
     by_pr: dict[str, list[dict]] = {}
     for f in findings.values():
@@ -211,8 +212,10 @@ def render_blocks(prs: list[str], findings: dict, pr_info: dict[str, dict]) -> l
         if not items:
             continue
         actionable = [f for f in items if f.get("status") in _ACTIONABLE]
+        closed_items = [f for f in items if f.get("status") not in _ACTIONABLE]
+        closed = len(closed_items)
         actionable.sort(key=lambda f: (f.get("status") != "open", not f.get("blocking"), str(f.get("path") or "~")))
-        closed = len(items) - len(actionable)
+        shown = actionable + (closed_items if include_closed else [])
         info = pr_info.get(pr, {})
         url = info.get("url") or next((f.get("pr_url") for f in items if f.get("pr_url")), "")
         label = f"{pr_short(pr)} {_mrkdwn_escape(_clip(info.get('title'), 90))}".strip()
@@ -222,7 +225,7 @@ def render_blocks(prs: list[str], findings: dict, pr_info: dict[str, dict]) -> l
         if closed:
             counts.append(f"{closed} closed")
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{head}\n{' · '.join(counts) or 'nothing open'}"}})
-        for f in actionable[:_MAX_FINDINGS_PER_PR]:
+        for f in shown[:limit]:
             icon = "⛔" if f.get("blocking") else _STATUS_ICON.get(f.get("status"), "•")
             where = f"`{f['path']}{':' + str(f['line']) if f.get('line') else ''}` " if f.get("path") else ""
             title = _mrkdwn_escape(_clip(_headline(f.get("body")), 150))
@@ -233,9 +236,9 @@ def render_blocks(prs: list[str], findings: dict, pr_info: dict[str, dict]) -> l
             if f.get("url"):
                 line += f"  <{f['url']}|view>"
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line[:2900]}})
-        if len(actionable) > _MAX_FINDINGS_PER_PR:
+        if len(shown) > limit:
             blocks.append({"type": "context", "elements": [
-                {"type": "mrkdwn", "text": f"+{len(actionable) - _MAX_FINDINGS_PER_PR} more on {pr_short(pr)}"}]})
+                {"type": "mrkdwn", "text": f"+{len(shown) - limit} more on {pr_short(pr)}"}]})
         blocks.append({"type": "divider"})
         if len(blocks) >= _MAX_BLOCKS:
             break
@@ -262,6 +265,46 @@ def profile_cwd(profile: Optional[str]) -> str:
     return cwd if cwd.startswith("/") else ""
 
 
+# ── the /findings command ───────────────────────────────────────────────────────────────────────────
+COMMAND = {"name": "findings", "description": "Review findings for this branch's PR stack",
+           "argument_hint": "[all | PR number]"}
+
+
+def findings_command_enabled() -> bool:
+    return os.getenv("SLACK_FINDINGS_COMMAND", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def parse_command_args(text: str, known: set[str]) -> dict:
+    """``""`` -> the stack; ``all`` -> the stack with closed findings; ``4137``/``#4137``/``Org/Repo#4137`` -> that PR."""
+    arg = (text or "").strip()
+    if not arg:
+        return {"mode": "stack", "closed": False}
+    words = arg.lower().split()
+    if words[0] == "all":
+        return {"mode": "stack", "closed": True}
+    if re.fullmatch(r"#?\d{1,6}", words[0]):
+        arg = "PR " + words[0].lstrip("#") + " " + " ".join(words[1:])
+    prs = extract_prs(arg, known)
+    if prs:
+        return {"mode": "pr", "pr": prs[0], "closed": "all" in words[1:]}
+    return {"mode": "error", "error": f"Don't know `{_clip(arg, 40)}`. Try `/findings`, `/findings all` or `/findings 4137`."}
+
+
+def summary_line(prs: list[str], findings: dict) -> str:
+    counts: dict[str, int] = {}
+    with_findings = 0
+    for pr in prs:
+        mine = [f for f in findings.values() if isinstance(f, dict) and f.get("pr") == pr]
+        with_findings += bool(mine)
+        for f in mine:
+            counts[f.get("status", "open")] = counts.get(f.get("status", "open"), 0) + 1
+    parts = [f"{counts[s]} {s}" for s in ("open", "planned") if counts.get(s)]
+    closed = sum(v for k, v in counts.items() if k not in _ACTIONABLE)
+    if closed:
+        parts.append(f"{closed} closed")
+    return f"{len(prs)} PR{'s' if len(prs) != 1 else ''} · {with_findings} with findings · " + (" · ".join(parts) or "nothing open")
+
+
 # ── adapter side ─────────────────────────────────────────────────────────────────────────────────────
 class SlackFindingsMixin:
     """Watches the findings file and keeps each linked Code channel's Findings tab current."""
@@ -275,6 +318,7 @@ class SlackFindingsMixin:
         self._findings_last: dict[str, float] = {}
         self._findings_stacks: dict[str, tuple[float, list[str], dict]] = {}
         self._findings_refresh_at = 0.0
+        self._findings_commands_set: set[str] = set()
 
     def _findings_online(self) -> None:
         if not findings_view_enabled() or self._findings_task is not None:
@@ -418,3 +462,58 @@ class SlackFindingsMixin:
         except Exception as exc:
             self._findings_digest.pop(channel, None)
             logger.debug("[Slack] findings setView failed: %s", exc, exc_info=True)
+
+    # ── /findings: registered per Code channel (agents.conversations.setCommands), answered ephemerally ──
+    def _register_findings_command_handler(self, app: Any) -> None:
+        if not findings_command_enabled():
+            return
+        app.command(re.compile(r"^/findings$"))(self._handle_findings_command)
+
+    async def _register_channel_commands(self, channel: str) -> None:
+        """Offer ``/findings`` in the channel's composer. Replaces this bot's whole command set there."""
+        if not findings_command_enabled() or channel in self._findings_commands_set:
+            return
+        self._findings_commands_set.add(channel)
+        try:
+            await self._get_client(channel).api_call("agents.conversations.setCommands", json={
+                "channel_id": channel, "commands": [COMMAND]})
+        except Exception as exc:
+            logger.info("[Slack] setCommands for %s failed (%s); /findings won't show in that channel's composer", channel, exc)
+
+    async def findings_command_reply(self, channel: str, text: str) -> dict:
+        """The ephemeral reply (``text`` and ``blocks``) for ``/findings <text>`` in ``channel``."""
+        findings = load_json(findings_path())
+        known = {k for k in (set(load_prs()) | {f.get("pr") for f in findings.values() if isinstance(f, dict)}) if k}
+        args = parse_command_args(text, known)
+        if args["mode"] == "error":
+            return {"text": args["error"]}
+        stack, info = await self._findings_prs_for(channel)
+        info = {**load_prs(), **info}
+        if args["mode"] == "pr":
+            prs, head = [args["pr"]], ""
+        else:
+            prs = stack
+            if not prs:
+                return {"text": "No PR stack found for this channel's working directory (no branch with an open PR). "
+                                "Try `/findings 4137` to look at one PR."}
+            head = summary_line(prs, findings)
+        blocks = render_blocks(prs, findings, info, include_closed=args["closed"],
+                               limit=20 if args["mode"] == "pr" else _MAX_FINDINGS_PER_PR)
+        if not blocks:
+            return {"text": f"No findings for {', '.join(pr_short(p) for p in prs[:6])}."
+                            + (f" ({head})" if head else "")}
+        if head:
+            blocks = [{"type": "context", "elements": [{"type": "mrkdwn", "text": head}]}] + blocks[:_MAX_BLOCKS - 1]
+        return {"text": head or "Findings", "blocks": blocks}
+
+    async def _handle_findings_command(self, ack, command, respond) -> None:
+        await ack()
+        channel, user = str(command.get("channel_id") or ""), str(command.get("user_id") or "")
+        if self._slash_channel_gated(channel) or self._early_reject_unauthorized(user, channel, channel.startswith("D")):
+            return
+        try:
+            reply = await self.findings_command_reply(channel, str(command.get("text") or ""))
+        except Exception:
+            logger.warning("[Slack] /findings failed", exc_info=True)
+            reply = {"text": "Couldn't read the findings just now."}
+        await respond(response_type="ephemeral", **reply)

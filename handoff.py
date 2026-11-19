@@ -216,6 +216,9 @@ class SlackHandoffMixin:
         if not channel:
             return {"ok": False, "error": "Slack didn't return a channel."}
         self._code_channels[channel] = True
+        register = getattr(self, "_register_channel_commands", None)  # the delegate's /findings etc.
+        if register is not None:
+            asyncio.ensure_future(register(channel))
         if self._slash_channel_gated(channel):  # the delegate's allowed_channels / ignored_channels would drop the task
             return {"ok": False, "channel_id": channel, "channel_mention": f"<#{channel}>",
                     "error": "The channel was created but this bot ignores it (allowed_channels/ignored_channels)."}

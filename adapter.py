@@ -1676,6 +1676,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             _slash_pattern = re.compile(r"^/hermes$")
 
         self._app.command(_slash_pattern)(self._handle_hermes_command)
+        self._register_findings_command_handler(self._app)  # /findings (findings_view.py)
 
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
         for _action_id in self._APPROVAL_CHOICES:
@@ -4737,6 +4738,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         so a retry/edit can re-drive it. Pre-existing claims stay."""
         await self._note_code_channel_message(event or {})
         self._findings_note_text(str((event or {}).get("channel") or ""), str((event or {}).get("text") or ""))
+        if self._is_known_code_channel(str((event or {}).get("channel") or "")):
+            asyncio.ensure_future(self._register_channel_commands(str(event["channel"])))
         _ts = str((event or {}).get("ts") or "")
         # getattr: bare test doubles (object.__new__) may lack the map.
         _claims = getattr(self, "_processed_message_ts", None)

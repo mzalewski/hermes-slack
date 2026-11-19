@@ -229,3 +229,59 @@ def test_unreadable_file_and_failed_publish_do_not_break_the_watcher(monkeypatch
         assert "C1" not in a._findings_digest
         a._findings_offline()
     asyncio.run(go())
+
+
+# ── /findings ──
+def test_parse_command_args():
+    known = {f"{REPO}#4067"}
+    assert fv.parse_command_args("", known) == {"mode": "stack", "closed": False}
+    assert fv.parse_command_args(" ALL ", known) == {"mode": "stack", "closed": True}
+    assert fv.parse_command_args("4067", known) == {"mode": "pr", "pr": f"{REPO}#4067", "closed": False}
+    assert fv.parse_command_args("#4067 all", known) == {"mode": "pr", "pr": f"{REPO}#4067", "closed": True}
+    assert fv.parse_command_args("Other/Repo#5", known)["pr"] == "Other/Repo#5"
+    assert fv.parse_command_args("banana", known)["mode"] == "error"
+
+
+def test_summary_line_and_closed_rendering():
+    f = table(finding(1), finding(2, status="planned"), finding(3, status="rejected", body="Rejected one"))
+    assert fv.summary_line([f"{REPO}#4067", f"{REPO}#4068"], f) == "2 PRs · 1 with findings · 1 open · 1 planned · 1 closed"
+    plain = json.dumps(fv.render_blocks([f"{REPO}#4067"], f, {}), ensure_ascii=False)
+    full = json.dumps(fv.render_blocks([f"{REPO}#4067"], f, {}, include_closed=True), ensure_ascii=False)
+    assert "Rejected one" not in plain and "Rejected one" in full and "⚪" in full
+
+
+def test_findings_command_reply_modes(monkeypatch, tmp_path):
+    async def go():
+        setup_files(monkeypatch, tmp_path, table(finding(1), finding(2, pr=4068, status="rejected", body="Old"), finding(3, pr=4070)))
+        a = Fake()
+        a.stacks["C1"] = [4067, 4068]
+        r = await a.findings_command_reply("C1", "")
+        assert r["text"].startswith("2 PRs · 2 with findings") and "4070" not in json.dumps(r["blocks"])
+        assert r["blocks"][0]["type"] == "context"
+        assert "Old" not in json.dumps(r["blocks"])
+        assert "Old" in json.dumps((await a.findings_command_reply("C1", "all"))["blocks"])
+        assert "Issue 3" in json.dumps((await a.findings_command_reply("C1", "#4070"))["blocks"])  # any PR, in or out of the stack
+        assert "No findings for #4071" in (await a.findings_command_reply("C1", "PR 4071"))["text"]
+        assert "No PR stack" in (await a.findings_command_reply("C2", ""))["text"]
+        assert "Don't know" in (await a.findings_command_reply("C1", "nonsense"))["text"]
+    asyncio.run(go())
+
+
+def test_command_registered_once_per_channel_and_flag_off(monkeypatch):
+    async def go():
+        a = Fake()
+        await a._register_channel_commands("C1")
+        await a._register_channel_commands("C1")
+        assert [c[0] for c in a.calls] == ["agents.conversations.setCommands"]
+        assert a.calls[0][1] == {"channel_id": "C1", "commands": [fv.COMMAND]}
+        monkeypatch.setenv("SLACK_FINDINGS_COMMAND", "false")
+        await a._register_channel_commands("C2")
+        assert len(a.calls) == 1
+        a2 = Fake()
+
+        async def boom(method, json=None):
+            raise RuntimeError("no_actions_url")
+        a2._client.api_call = boom
+        monkeypatch.delenv("SLACK_FINDINGS_COMMAND")
+        await a2._register_channel_commands("C1")  # logged, never raised
+    asyncio.run(go())
