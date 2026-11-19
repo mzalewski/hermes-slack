@@ -5058,7 +5058,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             # the gateway as a person and escape the bot loop guard. Cached by _peer_bot_drop.
             is_bot=self._event_declares_bot_sender(event) or await self._resolve_user_is_bot(
                 user_id, chat_id=channel_id, team_id=team_id))
-        source.shared_session = event.get("channel_type") == "mpim"  # a group DM keys "dm" but is shared
+        # A group DM keys "dm" but is shared; a Code channel is shared too (set by build_source): keep that flag.
+        source.shared_session = self._message_shared_session(source, event)
         from gateway.platforms.base import resolve_channel_skills
         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
         # above); render as ``@DisplayName`` so the agent knows who is addressed.

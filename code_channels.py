@@ -52,6 +52,12 @@ class SlackCodeChannelMixin:
             return dataclasses.replace(source, shared_session=True)
         return source
 
+    @staticmethod
+    def _message_shared_session(source: Any, event: dict) -> bool:
+        """Whether an inbound message's session is shared by everyone in the chat: a group DM (mpim), or
+        whatever ``build_source`` already decided (a Code channel). Must not reset a flag already set."""
+        return bool(getattr(source, "shared_session", False)) or (event or {}).get("channel_type") == "mpim"
+
     def _code_channel_cards_enabled(self) -> bool:
         return code_channel_cards_enabled()
 

@@ -191,3 +191,11 @@ def test_shared_session_flag_off(monkeypatch):
     a = SharedAdapter()
     a._code_channels["C1"] = True
     assert a.build_source("C1", chat_type="group", user_id="U1").shared_session is False
+
+
+def test_message_path_keeps_the_code_channel_shared_flag_and_still_shares_group_dms():
+    f = cc.SlackCodeChannelMixin._message_shared_session
+    assert f(_Src("C1", shared_session=True), {"channel_type": "channel"}) is True   # the live bug: this used to become False
+    assert f(_Src("C1", shared_session=False), {"channel_type": "channel"}) is False  # ordinary channel: per-user
+    assert f(_Src("G1", shared_session=False), {"channel_type": "mpim"}) is True      # group DM: shared, as before
+    assert f(_Src("C1", shared_session=False), None) is False
