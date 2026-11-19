@@ -68,6 +68,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_vault_code import SlackVaultCodeMixin
     from .code_channels import SlackCodeChannelMixin
+    from .handoff import SlackHandoffMixin, register_tool as _register_handoff_tool
     from .subagents import SlackSubagentMixin, STOP_ACTION as _SUBAGENT_STOP, RESULT_ACTION as _SUBAGENT_RESULT
     from .task_labels import friendly_title as _friendly_title
     from .adapter_image_batch import collect_image_uploads
@@ -85,6 +86,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
     from code_channels import SlackCodeChannelMixin  # type: ignore
+    from handoff import SlackHandoffMixin, register_tool as _register_handoff_tool  # type: ignore
     from subagents import SlackSubagentMixin, STOP_ACTION as _SUBAGENT_STOP, RESULT_ACTION as _SUBAGENT_RESULT  # type: ignore
     from task_labels import friendly_title as _friendly_title  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
@@ -1008,7 +1010,7 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
-class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChannelMixin, SlackSubagentMixin, BasePlatformAdapter):
+class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChannelMixin, SlackSubagentMixin, SlackHandoffMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1136,6 +1138,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         self._native_stream_unsupported = False
         self._init_code_channel_state()  # Slack Code channels (code_channels.py)
         self._init_subagent_state()  # subagent monitoring (subagents.py)
+        self._init_handoff_state()  # hand tasks to a project bot's Code channel (handoff.py)
         # Socket Mode self-healing state for silently dropped websockets; the monotonic
         # start time is the grace window for the first ping/pong.
         self._app_token: Optional[str] = None
@@ -1833,6 +1836,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                 raise
             logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
             self._hint_allow_bots()
+            self._handoff_online()
             return True
         except Exception as e:  # pragma: no cover - defensive logging
             proxy_error = describe_proxy_error(e, proxy_url)
@@ -1899,6 +1903,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        self._handoff_offline()
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for key, stream in list(self._active_streams.items()):
             await self._seal_stream(key, stream)
@@ -7292,6 +7297,10 @@ def register(ctx) -> None:
     from .send_targets import SEND_ENTRY_KWARGS
     from .dashboard_card import DASHBOARD_CARD
     from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
+    try:  # the hand-a-task-to-a-Code-channel tool; must never stop the platform from loading
+        _register_handoff_tool(ctx)
+    except Exception:  # pragma: no cover - tool API missing on older Hermes
+        logger.warning("[Slack] slack_code_channel tool not registered", exc_info=True)
     try:  # observer hooks for subagent monitoring; must never stop the platform from loading
         from .subagents import register_hooks
         register_hooks(ctx)
