@@ -406,6 +406,10 @@ class SlackSubagentMixin:
         ``details`` carries only the log lines this card hasn't been sent yet (``stream.log_cursor``);
         the cursor is committed by the caller after a successful send (``stream.cursor_next``)."""
         stream.cursor_next = {}
+        stream.started_next = set()
+        started = getattr(stream, "log_started", None)
+        if started is None:  # plain stand-in objects: infer from the cursor
+            started = {k for k, v in stream.log_cursor.items() if v}
         if not subagent_panel_enabled():
             return []
         recs = self._rows_for(stream)[-6:]
@@ -417,7 +421,7 @@ class SlackSubagentMixin:
             if rec.live and closing:
                 # The card is closing but the run keeps going: never leave a row in progress.
                 status = "complete"
-                lines.append("↪ Running in background")
+                lines.append("↪ " + (getattr(stream, "closing_note", "") or "Running in background"))
             elif rec.live and rec.status == "stopping":
                 lines.append("⏹ Stopping…")
             sent = stream.log_cursor.get(rec.subagent_id, 0)
@@ -429,7 +433,9 @@ class SlackSubagentMixin:
                 title = f"🔀 {rec.goal or 'Subagent'}"
             chunk = {"type": "task_update", "id": f"sub-{rec.subagent_id}"[:64], "title": title[:120], "status": status}
             if fresh:
-                chunk["details"] = ("\n" if sent else "") + "\n".join(fresh)
+                # Slack appends `details`: a row's first lines on THIS card start clean, later ones on a new line.
+                chunk["details"] = ("\n" if rec.subagent_id in started else "") + "\n".join(fresh)
+                stream.started_next.add(rec.subagent_id)
             chunks.append(chunk)
         return chunks
 

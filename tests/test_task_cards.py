@@ -33,10 +33,14 @@ def mod():
 class Client:
     def __init__(self):
         self.calls = []
+        self.n = 0
 
     async def api_call(self, method, json=None):
         self.calls.append((method, json))
-        return {"ok": True, "ts": "100.1"}
+        if method == "chat.startStream":
+            self.n += 1
+            return {"ok": True, "ts": f"100.{self.n}"}
+        return {"ok": True}
 
 
 def make(mod, interval=0.05, code=True):
@@ -201,6 +205,120 @@ def test_claude_code_row_streams_one_new_line_per_frame_and_closes_cleanly(mod):
             assert last["status"] == "complete" and "Not run: Reading calc.py" in last["details"] and "Done" in last["details"]
             await a.stop_native_task_card_progress("C1", metadata={})
             assert [c[0] for c in a.client.calls][-1] == "chat.stopStream"
+        run(go())
+    finally:
+        sa.TRACKER = orig_t
+
+
+# ── a message lands below the card: later steps move to a new card ───────────
+def methods(a):
+    return [c[0] for c in a.client.calls]
+
+
+def appends(a):
+    return [c for c in a.client.calls if c[0] == "chat.appendStream"]
+
+
+def test_later_steps_go_in_a_new_card_below_the_intervening_message(mod):
+    async def go():
+        a = make(mod, interval=0)
+        await a.send_native_task_card_progress("C1", [task(1, "complete"), task(2, "complete"), task(3)], metadata={})
+        a._code_channel_roots["9.9"] = None  # the user's message ts: replies to it are flat in a Code channel
+        a._supersede_task_cards("C1", None, {"thread_id": "9.9"})  # Hermes posts "Using Claude Code…" below the card
+        frame = [task(1, "complete"), task(2, "complete"), task(3, "complete"), task(4), task(5)]
+        await a.send_native_task_card_progress("C1", frame, metadata={})
+        assert methods(a) == ["chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream",
+                              "chat.startStream", "chat.appendStream"]
+        old_final, new_first = appends(a)[1], appends(a)[2]
+        assert old_final[1]["ts"] == "100.1" and new_first[1]["ts"] == "100.2"
+        assert [c["id"] for c in old_final[1]["chunks"]] == ["t1", "t2", "t3"]        # steps 1-3 stay above
+        assert [c["id"] for c in new_first[1]["chunks"]] == ["t4", "t5"]              # 4-5 start below
+        assert "thread_ts" not in a.client.calls[4][1]                                 # still a flat card
+        # later frames carry the full list again; finished steps stay out of the new card
+        await a.send_native_task_card_progress("C1", frame[:3] + [task(4, "complete"), task(5), task(6)], metadata={})
+        assert [c["id"] for c in appends(a)[-1][1]["chunks"]] == ["t4", "t5", "t6"]
+        await a.stop_native_task_card_progress("C1", metadata={})
+        assert methods(a)[-1] == "chat.stopStream" and a.client.calls[-1][1]["ts"] == "100.2"
+    run(go())
+
+
+def test_step_running_at_the_split_is_closed_above_and_continues_below(mod):
+    async def go():
+        a = make(mod, interval=0)
+        await a.send_native_task_card_progress("C1", [task(1, "complete"), task(2)], metadata={})
+        a._supersede_task_cards("C1", None, {})
+        await a.send_native_task_card_progress("C1", [task(1, "complete"), task(2), task(3)], metadata={})
+        old_final = {c["id"]: c for c in appends(a)[1][1]["chunks"]}
+        assert old_final["t2"]["status"] == "complete" and "continues below" in old_final["t2"]["details"]  # never left open
+        new = {c["id"]: c for c in appends(a)[2][1]["chunks"]}
+        assert set(new) == {"t2", "t3"} and new["t2"]["status"] == "in_progress"  # t1 finished above; t2 carries on
+    run(go())
+
+
+def test_nothing_running_after_the_message_just_closes_the_old_card(mod):
+    async def go():
+        a = make(mod, interval=0)
+        await a.send_native_task_card_progress("C1", [task(1)], metadata={})
+        a._supersede_task_cards("C1", None, {})  # e.g. the final reply
+        r = await a.send_native_task_card_progress("C1", [task(1, "complete")], metadata={})
+        assert r.success and methods(a) == ["chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream"]
+        assert appends(a)[1][1]["chunks"][0]["status"] == "complete"  # final state lands on the old card, no new card
+        await a.stop_native_task_card_progress("C1", metadata={})
+        assert methods(a).count("chat.stopStream") == 1
+    run(go())
+
+
+def test_only_a_message_in_the_cards_own_place_supersedes_it(mod):
+    async def go():
+        a = make(mod, interval=0)
+        await a.send_native_task_card_progress("C1", [task(1)], metadata={})
+        a._code_channel_roots["5.5"] = None
+        a._supersede_task_cards("C1", None, {"thread_id": "5.5", "message_id": "6.6"})  # same channel, top level -> yes
+        assert next(iter(a._native_task_card_streams.values())).superseded
+        b = make(mod, interval=0)
+        await b.send_native_task_card_progress("C1", [task(1)], metadata={})
+        b._supersede_task_cards("C2", None, {})                       # another chat
+        assert not next(iter(b._native_task_card_streams.values())).superseded
+        # a thread card is only superseded by a message in that thread
+        c = make(mod, interval=0)
+        md = {"thread_id": "7.7"}
+        key = ("", "C1", "7.7")
+        stream = mod._NativeTaskCardStream(team_id="", channel="C1", thread_ts="7.7", stream_ts="100.9")
+        c._native_task_card_streams[key] = stream
+        c._supersede_task_cards("C1", None, {"thread_id": "8.8"})
+        assert not stream.superseded
+        c._supersede_task_cards("C1", None, md)
+        assert stream.superseded
+    run(go())
+
+
+def test_live_claude_row_continues_in_the_new_card_without_repeating_its_log(mod):
+    sa = sys.modules[mod.__name__.rsplit(".", 1)[0] + ".subagents"]
+    tracker, orig_t = sa.SubagentTracker(), sa.TRACKER
+    sa.TRACKER = tracker
+    try:
+        def ev(name, **kw):
+            tracker.on_claude_event({"t": __import__("time").time(), "chat": "C1", "thread": "", "pid": 1,
+                                     "event": {"hook_event_name": name, "session_id": "s1", "cwd": "/r", **kw}})
+
+        async def go():
+            a = make(mod, interval=0)
+            await a.send_native_task_card_progress("C1", [task(1)], metadata={})
+            ev("UserPromptSubmit", prompt="fix add")
+            ev("PreToolUse", tool_name="Read", tool_use_id="u1", tool_input={"file_path": "/r/calc.py"})
+            await a._subagent_apply(tracker.for_chat("C1")[0], "tool")
+            a._supersede_task_cards("C1", None, {})
+            ev("PreToolUse", tool_name="Edit", tool_use_id="u2", tool_input={"file_path": "/r/calc.py"})
+            await a.send_native_task_card_progress("C1", [task(1)], metadata={})  # next core frame triggers the handover
+            row_old = [c for c in appends(a)[-2][1]["chunks"] if c["id"].startswith("sub-")][0]
+            assert row_old["status"] == "complete" and "continues below" in row_old["details"]
+            assert "Editing calc.py" in row_old["details"]  # lines up to the handover are finished above
+            row_new = [c for c in appends(a)[-1][1]["chunks"] if c["id"].startswith("sub-")][0]
+            assert row_new["status"] == "in_progress" and "details" not in row_new  # live row carried over, no repeated history
+            ev("PreToolUse", tool_name="Bash", tool_use_id="u3", tool_input={"command": "pytest"})
+            await a._subagent_apply(tracker.for_chat("C1")[0], "tool")
+            row_next = [c for c in appends(a)[-1][1]["chunks"] if c["id"].startswith("sub-")][0]
+            assert row_next["details"] == "Running pytest"  # then only new lines, first of the new card (no leading newline)
         run(go())
     finally:
         sa.TRACKER = orig_t
