@@ -12,6 +12,11 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def code_channel_cards_enabled() -> bool:
+    """Flat task cards in Code channels (still needs ``native_task_cards`` for the platform)."""
+    return os.getenv("SLACK_CODE_CHANNEL_TASK_CARDS", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
 def code_channels_enabled() -> bool:
     return os.getenv("SLACK_CODE_CHANNELS", "true").strip().lower() not in ("0", "false", "no", "off")
 
@@ -29,6 +34,9 @@ class SlackCodeChannelMixin:
     # (``agents.sessions.setStatus`` without ``thread_ts``) and Slack sends ``agent_session_stopped``
     # for the Stop button. https://docs.slack.dev/ai/slack-code/
     _CODE_CHANNEL_ROOTS_MAX = 5000
+
+    def _code_channel_cards_enabled(self) -> bool:
+        return code_channel_cards_enabled()
 
     def _is_known_code_channel(self, channel_id: str) -> bool:
         return bool(channel_id) and getattr(self, "_code_channels", {}).get(channel_id) is True

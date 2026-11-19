@@ -333,10 +333,13 @@ class _NativeTaskCardStream:
 
     team_id: str
     channel: str
-    thread_ts: str
+    thread_ts: str  # "" = flat (Slack Code channel top level)
     stream_ts: str = ""
     stopped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_sent: float = 0.0  # monotonic time of the last appendStream
+    pending: Optional[tuple] = None  # (tasks, title, metadata) held back by the throttle
+    flush_task: Optional[Any] = None
 
 
 def check_slack_requirements() -> bool:
@@ -2038,6 +2041,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
     ) -> Optional[tuple[str, str, str]]:
         thread_ts = self._resolve_thread_ts(reply_to, metadata)
         if not thread_ts:
+            if self._code_channel_cards_enabled() and self._is_known_code_channel(chat_id):
+                # One session per Code channel: a flat card keyed by channel, no thread anchor.
+                return (self._metadata_team_id(metadata) or "", str(chat_id), "")
             return None
         return self._workspace_thread_key(
             self._metadata_team_id(metadata), chat_id, str(thread_ts))
@@ -2048,6 +2054,23 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
     ) -> bool:
         """Placement eligibility independent of connection/stream availability."""
         return self._native_task_card_key(chat_id, reply_to, metadata) is not None
+
+    def _native_task_card_interval(self, stream: "_NativeTaskCardStream") -> float:
+        """Minimum seconds between card updates. Only flat Code-channel cards are throttled (default
+        5s, ``native_task_card_interval`` in extra / streaming.progress); thread cards stay un-throttled."""
+        if stream.thread_ts:
+            return 0.0
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        streaming = extra.get("streaming")
+        progress = streaming.get("progress") if isinstance(streaming, dict) else {}
+        for scope in (extra, progress if isinstance(progress, dict) else {}):
+            value = scope.get("native_task_card_interval")
+            if value is not None:
+                try:
+                    return max(0.0, float(value))
+                except (TypeError, ValueError):
+                    break
+        return 5.0
 
     async def send_native_task_card_progress(
         self, chat_id: str, tasks: list[dict[str, str]], *, title: Optional[str] = None,
@@ -2070,39 +2093,71 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         async with stream.lock:
             if stream.stopped:
                 return SendResult(success=False, error="Progress stream already stopped")
-            try:
-                client = self._get_client(chat_id, team_id=stream.team_id)
-                if not stream.stream_ts:
-                    await self._start_native_task_card_stream(client, stream, metadata)
-                chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
-                chunks.extend(self._task_update_chunk(task) for task in tasks)
-                # chunks-only: Slack rejects markdown_text alongside chunks
-                # (cannot_provide_both_markdown_text_and_chunks, #87743); the gateway owns
-                # the editable-text fallback rail that fallback_text feeds when this call fails.
-                try:
-                    await client.api_call(
-                        "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
-                except Exception as exc:
-                    if not _slack_error_is(exc, "message_not_in_streaming_state"):
-                        raise
-                    # Slack seals a native stream server-side after a few minutes of a long
-                    # turn (live-observed at ~5m20s, 2026-09-16; the lifetime is not
-                    # documented). The sealed message is a regular message now, so reopen a
-                    # fresh card in the same thread. Every frame already carries the FULL
-                    # visible projection, so nothing is lost; the user sees the card
-                    # continue instead of degrading to text bubbles. One reopen per update:
-                    # a second rejection is a real failure.
-                    logger.info(
-                        "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
-                        "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
-                    stream.stream_ts = ""
-                    await self._start_native_task_card_stream(client, stream, metadata)
-                    await client.api_call(
-                        "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
+            interval = self._native_task_card_interval(stream)
+            wait = interval - (time.monotonic() - stream.last_sent)
+            if stream.stream_ts and wait > 0:
+                # Throttled: keep only the latest frame (each frame carries the full task list).
+                stream.pending = (tasks, title, metadata)
+                if stream.flush_task is None or stream.flush_task.done():
+                    stream.flush_task = asyncio.create_task(self._flush_native_task_card_later(stream, wait))
                 return SendResult(success=True, message_id=stream.stream_ts)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
-                return SendResult(success=False, error=str(exc), retryable=True)
+            return await self._append_native_task_card(stream, tasks, title, metadata)
+
+    async def _flush_native_task_card_later(self, stream: "_NativeTaskCardStream", delay: float) -> None:
+        await asyncio.sleep(delay)
+        async with stream.lock:
+            if stream.stopped or stream.pending is None:
+                return
+            tasks, title, metadata = stream.pending
+            await self._append_native_task_card(stream, tasks, title, metadata)
+
+    async def _append_native_task_card(
+        self, stream: "_NativeTaskCardStream", tasks: list[dict[str, str]], title: str,
+        metadata: Optional[dict[str, Any]]) -> SendResult:
+        """Start (if needed) and append one frame. Caller holds ``stream.lock``."""
+        chat_id = stream.channel
+        stream.pending = None
+        try:
+            client = self._get_client(chat_id, team_id=stream.team_id)
+            if not stream.stream_ts:
+                await self._start_native_task_card_stream(client, stream, metadata)
+            # Flat (Code channel) cards have no plan heading: steps sit in one block, untitled.
+            chunks: list[dict[str, Any]] = (
+                [{"type": "plan_update", "title": str(title)[:256]}] if stream.thread_ts else [])
+            try:
+                from plugins.platforms.slack.task_labels import friendly_title
+            except ImportError:  # flat import
+                from task_labels import friendly_title  # type: ignore
+            for task in tasks:
+                chunk = self._task_update_chunk(task)
+                if not stream.thread_ts:
+                    chunk["title"] = friendly_title(chunk["title"])[:256]
+                chunks.append(chunk)
+            # chunks-only: Slack rejects markdown_text alongside chunks
+            # (cannot_provide_both_markdown_text_and_chunks, #87743); the gateway owns
+            # the editable-text fallback rail that fallback_text feeds when this call fails.
+            try:
+                await client.api_call(
+                    "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
+            except Exception as exc:
+                if not _slack_error_is(exc, "message_not_in_streaming_state"):
+                    raise
+                # Slack seals a native stream server-side after a few minutes of a long turn
+                # (live-observed at ~5m20s, 2026-09-16). The sealed message is a regular message
+                # now, so reopen a fresh card. Every frame carries the FULL visible projection, so
+                # nothing is lost. One reopen per update: a second rejection is a real failure.
+                logger.info(
+                    "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
+                    "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts or "(flat)")
+                stream.stream_ts = ""
+                await self._start_native_task_card_stream(client, stream, metadata)
+                await client.api_call(
+                    "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
+            stream.last_sent = time.monotonic()
+            return SendResult(success=True, message_id=stream.stream_ts)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc), retryable=True)
 
     @staticmethod
     async def _start_native_task_card_stream(
@@ -2110,8 +2165,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
     ) -> None:
         """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
         start_payload: dict[str, Any] = {
-            "channel": stream.channel, "thread_ts": stream.thread_ts,
-            "task_display_mode": "plan"}
+            "channel": stream.channel, "task_display_mode": "plan"}
+        if stream.thread_ts:
+            start_payload["thread_ts"] = stream.thread_ts
         md = metadata or {}
         recipients = (
             ("recipient_team_id", ("recipient_team_id", "team_id", "slack_team_id")),
@@ -2141,6 +2197,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         async with stream.lock:
             if stream.stopped:
                 return
+            if stream.flush_task is not None and not stream.flush_task.done():
+                stream.flush_task.cancel()
+            if stream.pending is not None and not stream.stopped:
+                tasks, title, metadata = stream.pending
+                await self._append_native_task_card(stream, tasks, title, metadata)  # final frame
             stream.stopped = True
             try:
                 if self._app and stream.stream_ts:
