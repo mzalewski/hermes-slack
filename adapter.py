@@ -68,6 +68,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_vault_code import SlackVaultCodeMixin
     from .code_channels import SlackCodeChannelMixin
+    from .findings_view import SlackFindingsMixin
     from .handoff import SlackHandoffMixin, register_tool as _register_handoff_tool
     from .subagents import SlackSubagentMixin, STOP_ACTION as _SUBAGENT_STOP, RESULT_ACTION as _SUBAGENT_RESULT
     from .task_labels import friendly_title as _friendly_title
@@ -86,6 +87,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
     from code_channels import SlackCodeChannelMixin  # type: ignore
+    from findings_view import SlackFindingsMixin  # type: ignore
     from handoff import SlackHandoffMixin, register_tool as _register_handoff_tool  # type: ignore
     from subagents import SlackSubagentMixin, STOP_ACTION as _SUBAGENT_STOP, RESULT_ACTION as _SUBAGENT_RESULT  # type: ignore
     from task_labels import friendly_title as _friendly_title  # type: ignore
@@ -1010,7 +1012,7 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
-class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChannelMixin, SlackSubagentMixin, SlackHandoffMixin, BasePlatformAdapter):
+class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChannelMixin, SlackSubagentMixin, SlackHandoffMixin, SlackFindingsMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1138,6 +1140,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         self._native_stream_unsupported = False
         self._init_code_channel_state()  # Slack Code channels (code_channels.py)
         self._init_subagent_state()  # subagent monitoring (subagents.py)
+        self._init_findings_state()  # Findings tab from the PR-review findings.json (findings_view.py)
         self._init_handoff_state()  # hand tasks to a project bot's Code channel (handoff.py)
         # Socket Mode self-healing state for silently dropped websockets; the monotonic
         # start time is the grace window for the first ping/pong.
@@ -1837,6 +1840,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
             self._hint_allow_bots()
             self._handoff_online()
+            self._findings_online()
             return True
         except Exception as e:  # pragma: no cover - defensive logging
             proxy_error = describe_proxy_error(e, proxy_url)
@@ -1904,6 +1908,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         """Disconnect from Slack."""
         self._running = False
         self._handoff_offline()
+        self._findings_offline()
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for key, stream in list(self._active_streams.items()):
             await self._seal_stream(key, stream)
@@ -2411,6 +2416,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         moves later steps into a new card below it (see ``_handover_task_card``)."""
         result = await self._send_plain(chat_id, content, reply_to=reply_to, metadata=metadata)
         if getattr(result, "success", False):
+            self._findings_note_text(chat_id, content)
             self._supersede_task_cards(chat_id, reply_to, metadata)
         return result
 
@@ -4730,6 +4736,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
         so a retry/edit can re-drive it. Pre-existing claims stay."""
         await self._note_code_channel_message(event or {})
+        self._findings_note_text(str((event or {}).get("channel") or ""), str((event or {}).get("text") or ""))
         _ts = str((event or {}).get("ts") or "")
         # getattr: bare test doubles (object.__new__) may lack the map.
         _claims = getattr(self, "_processed_message_ts", None)
