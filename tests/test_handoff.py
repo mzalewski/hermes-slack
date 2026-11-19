@@ -49,7 +49,7 @@ def test_tool_schema_lists_projects_and_requires_the_three_fields():
 # ── the handler: every refusal is a JSON error, never an exception ──
 def env(monkeypatch, **values):
     base = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_PROFILE": "", "HERMES_SESSION_CHAT_ID": "C1",
-            "HERMES_SESSION_MESSAGE_ID": "1.5", "HERMES_SESSION_USER_ID": "U1"}
+            "HERMES_SESSION_MESSAGE_ID": "1.5", "HERMES_SESSION_USER_ID": "", "HERMES_SESSION_ACTOR_ID": "U1"}
     base.update(values)
     monkeypatch.setattr(h, "_session_env", lambda name: base.get(name, ""))
     monkeypatch.setattr(h, "discover_projects", lambda *a, **k: {"curate": "curate-bot"})
@@ -119,6 +119,21 @@ def test_handler_calls_the_delegate_adapter_on_its_loop(monkeypatch):
         assert k["session_id"] == "handoff-C1-1.5-fix-login"  # stable: a retry maps to the same channel
         h.unregister_adapter(d)
         assert "isn't connected" in call(**GOOD)["error"]
+    finally:
+        lt.stop()
+
+
+def test_the_requesting_user_is_the_actor_even_when_the_route_user_id_is_empty(monkeypatch):
+    """Regression: a shared chat has an empty HERMES_SESSION_USER_ID; reading only that refused every handoff."""
+    lt = LoopThread()
+    try:
+        d = FakeDelegate(lt.loop)
+        h.register_adapter(d)
+        env(monkeypatch)  # USER_ID "", ACTOR_ID "U1"
+        assert call(**GOOD)["ok"] and d.calls[-1]["user_id"] == "U1"
+        env(monkeypatch, HERMES_SESSION_ACTOR_ID="", HERMES_SESSION_USER_ID="U7")  # per-user chat: route user is the asker
+        assert call(**GOOD)["ok"] and d.calls[-1]["user_id"] == "U7"
+        h.unregister_adapter(d)
     finally:
         lt.stop()
 
@@ -218,7 +233,8 @@ def test_no_origin_message_means_no_origin_params():
 def test_refusals_create_nothing():
     d = Delegate(FakeClient(), authorized=False)
     assert "isn't authorised" in create(d)["error"] and d.client.calls == [] and d.dispatched == []
-    assert "isn't authorised" in create(Delegate(FakeClient()), user_id="")["error"]
+    unknown = create(Delegate(FakeClient()), user_id="")  # a missing user is its own error, not "not authorised"
+    assert "Couldn't tell which Slack user" in unknown["error"] and "authorised" not in unknown["error"]
     f = Delegate(FakeClient(fail_all=True))
     assert "refused to create" in create(f)["error"] and f.dispatched == []
     g = Delegate(FakeClient(), gated=True)  # the delegate's own allowed/ignored channel rules would drop the task

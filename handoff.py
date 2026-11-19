@@ -157,8 +157,9 @@ def handoff_tool(args: dict, **_kwargs: Any) -> str:
                 return _result(False, error="Cannot hand off from the delegate's own event loop.")
         except RuntimeError:
             pass  # no loop in this thread: the normal case for a tool call
-        origin_chat, origin_ts, user = (_session_env("HERMES_SESSION_CHAT_ID"), _session_env("HERMES_SESSION_MESSAGE_ID"),
-                                        _session_env("HERMES_SESSION_USER_ID"))
+        # ACTOR is who asked this turn; USER_ID is the session route and is empty in a shared chat.
+        user = _session_env("HERMES_SESSION_ACTOR_ID") or _session_env("HERMES_SESSION_USER_ID")
+        origin_chat, origin_ts = _session_env("HERMES_SESSION_CHAT_ID"), _session_env("HERMES_SESSION_MESSAGE_ID")
         name = channel_name(project, task_name)
         session_id = f"handoff-{origin_chat}-{origin_ts or 'x'}-{slugify(task_name)}"[:120]
         future = asyncio.run_coroutine_threadsafe(delegate.handoff_create(
@@ -189,8 +190,10 @@ class SlackHandoffMixin:
 
     async def handoff_create(self, *, name: str, session_id: str, task: str, origin_channel: str,
                              origin_ts: str, user_id: str) -> dict:
-        if not user_id or self._early_reject_unauthorized(user_id, origin_channel or "", False):
-            return {"ok": False, "error": "The requesting user isn't authorised to use this bot."}
+        if not user_id:
+            return {"ok": False, "error": "Couldn't tell which Slack user is asking, so nothing was created."}
+        if self._early_reject_unauthorized(user_id, origin_channel or "", False):
+            return {"ok": False, "error": f"The requesting user isn't authorised to use the {getattr(self, '_owner_profile', None) or 'default'} bot."}
         if session_id in self._handoffs:  # same request again: same channel, and the task is already running
             channel = self._handoffs[session_id]
             return {"ok": True, "channel_id": channel, "channel_mention": f"<#{channel}>", "name": name, "repeat": True}
