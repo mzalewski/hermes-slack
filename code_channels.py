@@ -108,7 +108,7 @@ class SlackCodeChannelMixin:
     async def _handle_agent_session_stopped(self, event: dict, body: Optional[dict] = None) -> None:
         """Slack's native Stop (code channel or thread); see ``native_stop.py``."""
         try:
-            from plugins.platforms.slack.native_stop import handle_agent_session_stopped
+            from .native_stop import handle_agent_session_stopped
         except ImportError:  # flat import (tests, standalone)
             from native_stop import handle_agent_session_stopped  # type: ignore
         await handle_agent_session_stopped(self, event, body)

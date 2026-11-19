@@ -18,13 +18,16 @@ def mod():
         import gateway.config  # noqa: F401
     except Exception:
         pytest.skip("Hermes not importable")
-    pkg = types.ModuleType("plugins.platforms.slack")
-    pkg.__path__ = [str(PLUGIN_DIR)]
-    importlib.import_module("plugins.platforms")
-    for name in [n for n in sys.modules if n.startswith("plugins.platforms.slack")]:
-        del sys.modules[name]
-    sys.modules["plugins.platforms.slack"] = pkg
-    return importlib.import_module("plugins.platforms.slack.adapter")
+    # Load as the real plugin loader does (hermes_plugins.* name, relative imports), NOT as
+    # plugins.platforms.slack, which is Hermes's bundled copy and lacks our modules.
+    import importlib.util
+    name = "hermes_plugins.platforms__slack__home_test"
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)])
+    pkg = importlib.util.module_from_spec(spec)
+    sys.modules[name] = pkg
+    spec.loader.exec_module(pkg)
+    return sys.modules[name + ".adapter"]
 
 
 class Client:
@@ -106,7 +109,7 @@ def test_flag_disables_flat_cards(mod, monkeypatch):
 
 
 def test_friendly_titles(mod):
-    from plugins.platforms.slack.task_labels import friendly_title as f
+    f = mod._friendly_title
     assert f("web_search - refresh tokens") == "Checking the web: refresh tokens"
     assert f("terminal - pytest -q") == "Running pytest -q"
     assert f("todo") == "Updating plan"

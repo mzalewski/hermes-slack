@@ -50,7 +50,6 @@ from gateway.platforms._shared import (
 )
 from gateway.platforms.base_log_safety import safe_url_for_log
 from gateway.platforms.helpers import MessageDeduplicator, clarify_text_with_choices, inline_document_text
-from plugins.platforms.slack.code_channels import SlackCodeChannelMixin, code_channels_enabled
 from plugins.platforms.slack.adapter_config_readers import (
     _extra_or_env_channel_set_getter, _extra_or_env_flag_getter)
 from gateway.platforms.base import (
@@ -68,6 +67,8 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_reactions_context import slack_reactions_marker
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_vault_code import SlackVaultCodeMixin
+    from .code_channels import SlackCodeChannelMixin
+    from .task_labels import friendly_title as _friendly_title
     from .adapter_image_batch import collect_image_uploads
     from .adapter_forwarded import (
         append_forwards, files_with_forwarded, is_forward, own_bot_ids, shared_message_sections,
@@ -82,6 +83,8 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
+    from code_channels import SlackCodeChannelMixin  # type: ignore
+    from task_labels import friendly_title as _friendly_title  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
 
 
@@ -2124,14 +2127,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             # Flat (Code channel) cards have no plan heading: steps sit in one block, untitled.
             chunks: list[dict[str, Any]] = (
                 [{"type": "plan_update", "title": str(title)[:256]}] if stream.thread_ts else [])
-            try:
-                from plugins.platforms.slack.task_labels import friendly_title
-            except ImportError:  # flat import
-                from task_labels import friendly_title  # type: ignore
             for task in tasks:
                 chunk = self._task_update_chunk(task)
                 if not stream.thread_ts:
-                    chunk["title"] = friendly_title(chunk["title"])[:256]
+                    chunk["title"] = _friendly_title(chunk["title"])[:256]
                 chunks.append(chunk)
             # chunks-only: Slack rejects markdown_text alongside chunks
             # (cannot_provide_both_markdown_text_and_chunks, #87743); the gateway owns
