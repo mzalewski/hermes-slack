@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 import weakref
@@ -106,6 +107,24 @@ def _closing_line(rec: "SubagentRecord") -> str:
     return {"complete": f"✓ Done{secs}", "failed": f"✗ Failed{secs}", "interrupted": f"■ Stopped{secs}"}.get(rec.status, "")
 
 
+def _short_title(goal: str, limit: int = 60) -> str:
+    """A prompt is often a paragraph: keep its first sentence-ish, cut at a word boundary."""
+    text = " ".join(str(goal or "").split())
+    first = re.split(r"(?<=[.!?:])\s", text, maxsplit=1)[0]
+    if len(first) > limit:
+        first = first[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:.") + "…"
+    return first
+
+
+def _short_error(error: Any) -> str:
+    """First line of a tool error, cut at the first run of output; "Exit code 1" stays as is."""
+    text = " ".join(str(error or "").split())
+    match = re.match(r"(Exit code \d+)", text)
+    if match:
+        return match.group(1)
+    return text[:60]
+
+
 def _claude_preview(tool_input: Any, cwd: str) -> str:
     """Short, readable argument for a Claude Code tool call (paths relative to the working directory)."""
     if not isinstance(tool_input, dict):
@@ -114,8 +133,9 @@ def _claude_preview(tool_input: Any, cwd: str) -> str:
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
             value = " ".join(value.split())
-            if key in ("file_path", "notebook_path", "path") and cwd and value.startswith(cwd.rstrip("/") + "/"):
-                value = value[len(cwd.rstrip("/")) + 1:]
+            if cwd:
+                prefix = cwd.rstrip("/") + "/"
+                value = value[len(prefix):] if value.startswith(prefix) else value.replace(prefix, "")
             return value[:60]
     return ""
 
@@ -274,9 +294,9 @@ class SubagentTracker:
             elif name == "PostToolUse":
                 rec.open_calls.pop(str(ev.get("tool_use_id") or ""), None)
             elif name == "PostToolUseFailure":
-                label = rec.open_calls.pop(str(ev.get("tool_use_id") or ""), "")
-                error = " ".join(str(ev.get("error") or "").split())[:70]
-                rec.log.append(f"✗ {label or 'Tool'} failed" + (f": {error}" if error else ""))
+                rec.open_calls.pop(str(ev.get("tool_use_id") or ""), None)
+                error = _short_error(ev.get("error"))
+                rec.log.append("✗ Failed" + (f": {error}" if error else ""))  # the line above already names the step
                 notify = "tool"
             elif name in ("Stop", "SessionEnd") and rec.live:
                 for label in rec.open_calls.values():
@@ -428,7 +448,7 @@ class SlackSubagentMixin:
             fresh = lines[sent:]
             stream.cursor_next[rec.subagent_id] = len(lines)
             if rec.kind == "claude":
-                title = "🤖 Claude Code" + (f": {rec.goal}" if rec.goal else "")
+                title = "🤖 Claude Code" + (f": {_short_title(rec.goal)}" if rec.goal else "")
             else:
                 title = f"🔀 {rec.goal or 'Subagent'}"
             chunk = {"type": "task_update", "id": f"sub-{rec.subagent_id}"[:64], "title": title[:120], "status": status}

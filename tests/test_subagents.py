@@ -275,7 +275,7 @@ def test_claude_run_lifecycle_and_titles(monkeypatch):
     cc(t, "Stop", last_assistant_message="Fixed it.", ts=110)
     rec = t.for_chat("C1")[0]
     assert rec.kind == "claude" and rec.status == "complete" and rec.summary == "Fixed it."
-    assert rec.log[:3] == ["Reading calc.py", "Editing calc.py", "✗ Editing calc.py failed: old_string not found"]
+    assert rec.log[:3] == ["Reading calc.py", "Editing calc.py", "✗ Failed: old_string not found"]
     assert rec.log[-1].startswith("✓ Done")
     row = Mixin()._subagent_task_chunks(S())[0]
     assert row["title"] == "🤖 Claude Code: fix the add bug" and row["status"] == "complete"
@@ -312,3 +312,15 @@ def test_claude_second_prompt_in_same_session_is_a_new_row_and_chats_isolated(mo
     cc(t, "UserPromptSubmit", prompt="other chat", sid="sess2", chat="C2", ts=201)
     assert [r.goal for r in t.for_chat("C1")] == ["one", "two"]
     assert [r.goal for r in t.for_chat("C2")] == ["other chat"]
+
+
+def test_polish_title_error_and_paths(monkeypatch):
+    long_prompt = 'The file test.js currently just contains: echo "hi"; This is not even valid JS (echo is not a JS function) so rewrite it'
+    assert sa._short_title(long_prompt) == "The file test.js currently just contains:"
+    assert sa._short_title("Fix the add bug in calc.py") == "Fix the add bug in calc.py"
+    assert len(sa._short_title("word " * 40)) <= 60 and sa._short_title("word " * 40).endswith("…")
+    assert sa._short_error("Exit code 1\n. .. .git test.js") == "Exit code 1"
+    assert sa._short_error("File does not exist. Note: your current working directory is /x") == "File does not exist. Note: your current working directory is /x"[:60]
+    assert sa._claude_preview({"command": "node /home/me/dev/test1/test.js"}, "/home/me/dev/test1") == "node test.js"
+    assert sa._claude_preview({"file_path": "/home/me/dev/test1/src/a.py"}, "/home/me/dev/test1") == "src/a.py"
+    assert sa._claude_preview({"command": "ls /etc"}, "/home/me/dev/test1") == "ls /etc"  # other paths untouched
