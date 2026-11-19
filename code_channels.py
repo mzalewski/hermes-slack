@@ -98,16 +98,9 @@ class SlackCodeChannelMixin:
                          exc_info=True)
 
     async def _handle_agent_session_stopped(self, event: dict, body: Optional[dict] = None) -> None:
-        """The user pressed Stop on an agent session (code channel, or a thread when ``thread_ts`` is
-        set): run the gateway's own ``/stop`` for that session. Slack updates the status itself."""
-        channel = str((event or {}).get("channel") or "")
-        if not channel:
-            return
-        getattr(self, "_code_channel_busy", set()).discard(channel)
-        stop = {"type": "message", "channel": channel, "user": event.get("user"), "text": "/stop",
-                "ts": str(event.get("event_ts") or "")}
-        if event.get("thread_ts"):
-            stop["thread_ts"] = event["thread_ts"]
-        logger.info("[Slack] agent_session_stopped in %s (thread %s): stopping the session",
-                    channel, event.get("thread_ts"))
-        await self._handle_slack_message(stop, body)
+        """Slack's native Stop (code channel or thread); see ``native_stop.py``."""
+        try:
+            from plugins.platforms.slack.native_stop import handle_agent_session_stopped
+        except ImportError:  # flat import (tests, standalone)
+            from native_stop import handle_agent_session_stopped  # type: ignore
+        await handle_agent_session_stopped(self, event, body)
