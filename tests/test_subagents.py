@@ -195,13 +195,10 @@ def test_card_rows_per_flat_and_thread_streams(monkeypatch):
     start(t)
     t.on_tool(task_id="s1", tool_name="read_file", args={"path": "a.py"})
     m = Mixin()
-    flat = types.SimpleNamespace(channel="C1", thread_ts="")
-    mine = types.SimpleNamespace(channel="C1", thread_ts="1.0")
-    other_thread = types.SimpleNamespace(channel="C1", thread_ts="2.0")
-    other_chat = types.SimpleNamespace(channel="C2", thread_ts="")
+    S = lambda ch, th: types.SimpleNamespace(channel=ch, thread_ts=th, log_cursor={}, cursor_next={})
+    flat, mine, other_thread, other_chat = S("C1", ""), S("C1", "1.0"), S("C1", "2.0"), S("C2", "")
     row = m._subagent_task_chunks(flat)[0]
-    assert row["id"] == "sub-s1" and row["status"] == "in_progress" and "1 tool" in row["details"]
-    assert "Opening a.py" in row["details"]
+    assert row["id"] == "sub-s1" and row["status"] == "in_progress" and row["details"] == "Opening a.py"
     assert len(m._subagent_task_chunks(mine)) == 1
     assert m._subagent_task_chunks(other_thread) == [] and m._subagent_task_chunks(other_chat) == []
 
@@ -211,10 +208,107 @@ def test_panel_flag_disables_rows_and_hooks(monkeypatch):
     slack_env(monkeypatch)
     start(t)
     monkeypatch.setenv("SLACK_SUBAGENT_PANEL", "false")
-    assert Mixin()._subagent_task_chunks(types.SimpleNamespace(channel="C1", thread_ts="")) == []
+    assert Mixin()._subagent_task_chunks(types.SimpleNamespace(channel="C1", thread_ts="", log_cursor={}, cursor_next={})) == []
     registered = {}
     ctx = types.SimpleNamespace(register_hook=lambda name, fn, **k: registered.setdefault(name, fn))
     sa.register_hooks(ctx)
     assert set(registered) == {"pre_llm_call", "subagent_start", "subagent_stop", "pre_tool_call"}
     registered["subagent_start"](child_subagent_id="zz", child_goal="x")  # disabled: no record
     assert t.get("zz") is None
+
+
+# ── details are appended by Slack: send only new lines ───────────────────────
+def S(ch="C1", th=""):
+    return types.SimpleNamespace(channel=ch, thread_ts=th, log_cursor={}, cursor_next={}, closing=False)
+
+
+def test_details_send_only_new_lines_with_leading_newline(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    start(t)
+    m, st = Mixin(), S()
+    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "a.py"})
+    first = m._subagent_task_chunks(st)[0]
+    assert first["details"] == "Opening a.py"
+    st.log_cursor.update(st.cursor_next)  # the caller commits after a successful send
+    assert "details" not in m._subagent_task_chunks(st)[0]  # nothing new: status-only update
+    t.on_tool(task_id="s1", tool_name="terminal", args={"command": "pytest"})
+    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "b.py"})
+    second = m._subagent_task_chunks(st)[0]
+    assert second["details"] == "\nRunning pytest\nOpening b.py"  # starts with \n so it lands on its own line
+
+
+def test_cursor_not_advanced_until_committed(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    start(t)
+    m, st = Mixin(), S()
+    t.on_tool(task_id="s1", tool_name="read_file", args={"path": "a.py"})
+    m._subagent_task_chunks(st)
+    again = m._subagent_task_chunks(st)  # the send failed, so the line must go out again
+    assert again[0]["details"] == "Opening a.py"
+
+
+def test_closing_hands_off_live_row_once(monkeypatch):
+    t = tracker(monkeypatch)
+    slack_env(monkeypatch)
+    start(t)
+    m, st = Mixin(), S()
+    st.closing = True
+    row = m._subagent_task_chunks(st)[0]
+    assert row["status"] == "complete" and "background" in row["details"]
+
+
+# ── Claude Code runs listed as subagents ─────────────────────────────────────
+def cc(t, name, sid="sess1", ts=100.0, chat="C1", thread="", **ev):
+    t.on_claude_event({"t": ts, "chat": chat, "thread": thread, "pid": 4242,
+                       "event": {"hook_event_name": name, "session_id": sid, "cwd": "/repo", **ev}})
+
+
+def test_claude_run_lifecycle_and_titles(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "UserPromptSubmit", prompt="fix the add bug", ts=100)
+    cc(t, "PreToolUse", tool_name="Read", tool_use_id="u1", tool_input={"file_path": "/repo/calc.py"}, ts=101)
+    cc(t, "PostToolUse", tool_name="Read", tool_use_id="u1", ts=102)
+    cc(t, "PreToolUse", tool_name="Edit", tool_use_id="u2", tool_input={"file_path": "/repo/calc.py"}, ts=103)
+    cc(t, "PostToolUseFailure", tool_name="Edit", tool_use_id="u2", error="old_string not found", ts=104)
+    cc(t, "Stop", last_assistant_message="Fixed it.", ts=110)
+    rec = t.for_chat("C1")[0]
+    assert rec.kind == "claude" and rec.status == "complete" and rec.summary == "Fixed it."
+    assert rec.log[:3] == ["Reading calc.py", "Editing calc.py", "✗ Editing calc.py failed: old_string not found"]
+    assert rec.log[-1].startswith("✓ Done")
+    row = Mixin()._subagent_task_chunks(S())[0]
+    assert row["title"] == "🤖 Claude Code: fix the add bug" and row["status"] == "complete"
+
+
+def test_claude_denied_call_is_closed_as_not_run_on_stop(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "UserPromptSubmit", prompt="run tests", ts=100)
+    cc(t, "PreToolUse", tool_name="Bash", tool_use_id="u1", tool_input={"command": "pytest -q"}, ts=101)  # never gets a result
+    cc(t, "Stop", ts=105)
+    rec = t.for_chat("C1")[0]
+    assert "✗ Not run: Running pytest -q" in rec.log and not rec.open_calls and not rec.live
+
+
+def test_claude_killed_run_closes_on_session_end_as_interrupted(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "UserPromptSubmit", prompt="x", ts=100)
+    cc(t, "SessionEnd", ts=101)
+    assert t.for_chat("C1")[0].status == "interrupted"
+
+
+def test_claude_events_without_prompt_still_tracked_and_title_has_prefix(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "PreToolUse", tool_name="Grep", tool_use_id="u1", tool_input={"pattern": "TODO"}, ts=100)
+    row = Mixin()._subagent_task_chunks(S())[0]
+    assert row["title"] == "🤖 Claude Code" and row["details"] == "Searching TODO"
+
+
+def test_claude_second_prompt_in_same_session_is_a_new_row_and_chats_isolated(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "UserPromptSubmit", prompt="one", ts=100)
+    cc(t, "Stop", ts=101)
+    cc(t, "UserPromptSubmit", prompt="two", ts=200)
+    cc(t, "UserPromptSubmit", prompt="other chat", sid="sess2", chat="C2", ts=201)
+    assert [r.goal for r in t.for_chat("C1")] == ["one", "two"]
+    assert [r.goal for r in t.for_chat("C2")] == ["other chat"]

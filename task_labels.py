@@ -13,6 +13,11 @@ _LABELS: dict[str, str] = {
     "terminal": "Running {p}", "process": "Checking process {p}", "execute_code": "Running code",
     "delegate_task": "Delegating: {p}", "todo": "Updating plan", "memory": "Checking memory",
     "skill_view": "Loading skill {p}", "clarify": "Asking a question", "vision_analyze": "Looking at {p}",
+    # Claude Code tool names (PascalCase, distinct from Hermes's snake_case ones)
+    "Read": "Reading {p}", "Write": "Writing {p}", "Edit": "Editing {p}", "MultiEdit": "Editing {p}",
+    "NotebookEdit": "Editing {p}", "Bash": "Running {p}", "Grep": "Searching {p}", "Glob": "Finding {p}",
+    "WebSearch": "Searching the web: {p}", "WebFetch": "Fetching {p}", "Task": "Delegating: {p}",
+    "TodoWrite": "Updating plan", "BashOutput": "Checking background command", "KillShell": "Stopping command",
 }
 _BROWSER = re.compile(r"^browser_")
 

@@ -135,7 +135,7 @@ def test_subagent_rows_appear_on_card_and_refresh_pushes_them(mod, monkeypatch):
             last = [c for c in a.client.calls if c[0] == "chat.appendStream"][-1][1]["chunks"]
             rows = [c for c in last if c["id"].startswith("sub-")]
             assert len(rows) == 1 and rows[0]["title"].startswith("🔀 Audit token expiry")
-            assert "1 tool" in rows[0]["details"]
+            assert rows[0]["details"] == "Opening auth.py"
             # core's own task is still there and keeps its plain-language title
             assert last[0]["title"] == "Opening f1.py"
             tracker.on_stop(child_session_id="cs1", child_status="completed", child_summary="done")
@@ -160,7 +160,7 @@ def test_card_close_hands_off_running_subagent_rows(mod):
             await a._subagent_apply(tracker.get("s1"), "start")
             mid = [c for c in a.client.calls if c[0] == "chat.appendStream"][-1][1]["chunks"]
             assert [c for c in mid if c["id"] == "sub-s1"][0]["status"] == "in_progress"
-            assert "details" in mid[-1] and "0 tools" not in mid[-1]["details"]
+            assert "details" not in mid[-1]  # no tool lines yet: a status-only update, never "0 tools"
             await a.stop_native_task_card_progress("C1", metadata={})
             methods = [c[0] for c in a.client.calls]
             assert methods[-1] == "chat.stopStream"
@@ -171,3 +171,36 @@ def test_card_close_hands_off_running_subagent_rows(mod):
         run(go())
     finally:
         sa.TRACKER, sa._session_env = orig_t, orig_e
+
+
+def test_claude_code_row_streams_one_new_line_per_frame_and_closes_cleanly(mod):
+    sa = sys.modules[mod.__name__.rsplit(".", 1)[0] + ".subagents"]
+    tracker, orig_t = sa.SubagentTracker(), sa.TRACKER
+    sa.TRACKER = tracker
+    try:
+        def ev(name, **kw):
+            tracker.on_claude_event({"t": __import__("time").time(), "chat": "C1", "thread": "", "pid": 1,
+                                     "event": {"hook_event_name": name, "session_id": "s1", "cwd": "/r", **kw}})
+
+        async def go():
+            a = make(mod, interval=0)
+            rows = lambda: [c for c in [x for x in a.client.calls if x[0] == "chat.appendStream"][-1][1]["chunks"] if c["id"].startswith("sub-")]
+            await a.send_native_task_card_progress("C1", [task(1)], metadata={})
+            ev("UserPromptSubmit", prompt="fix add")
+            await a._subagent_apply(tracker.for_chat("C1")[0], "start")
+            assert rows()[0]["title"] == "🤖 Claude Code: fix add" and "details" not in rows()[0]
+            ev("PreToolUse", tool_name="Read", tool_use_id="u1", tool_input={"file_path": "/r/calc.py"})
+            await a._subagent_apply(tracker.for_chat("C1")[0], "tool")
+            assert rows()[0]["details"] == "Reading calc.py"
+            ev("PreToolUse", tool_name="Bash", tool_use_id="u2", tool_input={"command": "pytest"})
+            await a._subagent_apply(tracker.for_chat("C1")[0], "tool")
+            assert rows()[0]["details"] == "\nRunning pytest"  # only the new line, on its own line
+            ev("Stop", last_assistant_message="done")  # u1/u2 never got a result event
+            await a._subagent_apply(tracker.for_chat("C1")[0], "stop")
+            last = rows()[0]
+            assert last["status"] == "complete" and "Not run: Reading calc.py" in last["details"] and "Done" in last["details"]
+            await a.stop_native_task_card_progress("C1", metadata={})
+            assert [c[0] for c in a.client.calls][-1] == "chat.stopStream"
+        run(go())
+    finally:
+        sa.TRACKER = orig_t

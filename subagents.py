@@ -47,7 +47,7 @@ def subagent_panel_enabled() -> bool:
 
 
 def subagent_view_enabled() -> bool:
-    return _flag("SLACK_SUBAGENT_VIEW")
+    return _flag("SLACK_SUBAGENT_VIEW", "false")
 
 
 def subagent_controls_enabled() -> bool:
@@ -69,6 +69,11 @@ class SubagentRecord:
     started: float = field(default_factory=time.time)
     ended: float = 0.0
     summary: str = ""
+    kind: str = "hermes"  # "hermes" (delegate_task child) | "claude" (Claude Code run launched by Hermes)
+    log: list = field(default_factory=list)  # one plain line per step; Slack appends `details`, so only new lines are sent
+    open_calls: dict = field(default_factory=dict)  # Claude Code tool_use_id -> label, for calls with no result yet
+    pid: int = 0  # Claude Code's process id (for a future per-run Stop)
+    cwd: str = ""
 
     @property
     def live(self) -> bool:
@@ -96,6 +101,25 @@ def _arg_preview(args: Any) -> str:
     return ""
 
 
+def _closing_line(rec: "SubagentRecord") -> str:
+    secs = f" in {int(rec.ended - rec.started)}s" if rec.ended and rec.ended > rec.started else ""
+    return {"complete": f"✓ Done{secs}", "failed": f"✗ Failed{secs}", "interrupted": f"■ Stopped{secs}"}.get(rec.status, "")
+
+
+def _claude_preview(tool_input: Any, cwd: str) -> str:
+    """Short, readable argument for a Claude Code tool call (paths relative to the working directory)."""
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("file_path", "notebook_path", "path", "pattern", "command", "url", "query", "description", "prompt"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            value = " ".join(value.split())
+            if key in ("file_path", "notebook_path", "path") and cwd and value.startswith(cwd.rstrip("/") + "/"):
+                value = value[len(cwd.rstrip("/")) + 1:]
+            return value[:60]
+    return ""
+
+
 def _normalise_status(raw: Any) -> str:
     text = str(raw or "").lower()
     if any(w in text for w in ("interrupt", "cancel", "stop")):
@@ -114,6 +138,7 @@ class SubagentTracker:
         self._records: "OrderedDict[str, SubagentRecord]" = OrderedDict()
         self._by_session: dict[str, str] = {}
         self._targets: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+        self._claude_current: dict[str, str] = {}
         self._adapters: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
     # ── adapters ──
@@ -191,9 +216,80 @@ class SubagentTracker:
             rec.summary = str(kw.get("child_summary") or "")[:2000]
             duration_ms = kw.get("duration_ms")
             rec.ended = rec.started + duration_ms / 1000.0 if isinstance(duration_ms, (int, float)) and duration_ms > 0 else time.time()
+            rec.log.append(_closing_line(rec))
         logger.info("[Slack] subagent %s finished: status=%s (raw=%r) tools=%d chat=%s", rec.subagent_id, rec.status,
                     kw.get("child_status"), rec.tool_count, rec.chat_id)
         self._notify(rec, "stop")
+
+    # ── Claude Code (events written by claude_code_hook.py, read by claude_code.py) ──
+    def _claude_record(self, session_id: str, chat: str, thread: str, new_prompt: Optional[str], t: float) -> Optional[SubagentRecord]:
+        """The record for a Claude Code session's current prompt. ``new_prompt`` (a UserPromptSubmit) opens
+        a fresh record; any other event reuses the session's current one, creating it if events began mid-run."""
+        with self._lock:
+            current = self._claude_current.get(session_id)
+            rec = self._records.get(current) if current else None
+            if new_prompt is None and rec is not None:
+                return rec
+            if new_prompt is None and rec is None and not session_id:
+                return None
+            rid = f"cc-{session_id[:10] or 'x'}-{int(t) % 100000}"
+            rec = SubagentRecord(
+                subagent_id=rid, goal=" ".join((new_prompt or "").split())[:300], role="claude-code",
+                parent_session_id="", child_session_id=session_id, chat_id=chat, thread_ts=thread,
+                kind="claude", started=t or time.time())
+            self._records[rid] = rec
+            self._claude_current[session_id] = rid
+            while len(self._records) > _MAX_RECORDS:
+                _, old = self._records.popitem(last=False)
+                self._claude_current.pop(old.child_session_id, None)
+            return rec
+
+    def on_claude_event(self, item: dict) -> None:
+        """Apply one hook event: PreToolUse adds a log line, PostToolUseFailure an error line, Stop /
+        SessionEnd close the run and mark anything still open as not run."""
+        ev = item.get("event") or {}
+        name = str(ev.get("hook_event_name") or "")
+        chat, thread = str(item.get("chat") or ""), str(item.get("thread") or "")
+        sid, t = str(ev.get("session_id") or ""), float(item.get("t") or time.time())
+        if not chat or name not in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop", "SessionEnd"):
+            return
+        fresh = name == "UserPromptSubmit"
+        rec = self._claude_record(sid, chat, thread, str(ev.get("prompt") or "") if fresh else None, t)
+        if rec is None:
+            return
+        notify = None
+        with self._lock:
+            rec.pid = int(item.get("pid") or rec.pid or 0)
+            rec.cwd = str(ev.get("cwd") or rec.cwd)
+            if fresh:
+                notify = "start"
+            elif name == "PreToolUse" and rec.live:
+                tool = str(ev.get("tool_name") or "tool")
+                preview = _claude_preview(ev.get("tool_input"), rec.cwd)
+                rec.last_tool = friendly_title(f"{tool} - {preview}" if preview else tool)
+                rec.open_calls[str(ev.get("tool_use_id") or rec.last_tool)] = rec.last_tool
+                rec.log.append(rec.last_tool)
+                rec.tool_count += 1
+                notify = "tool"
+            elif name == "PostToolUse":
+                rec.open_calls.pop(str(ev.get("tool_use_id") or ""), None)
+            elif name == "PostToolUseFailure":
+                label = rec.open_calls.pop(str(ev.get("tool_use_id") or ""), "")
+                error = " ".join(str(ev.get("error") or "").split())[:70]
+                rec.log.append(f"✗ {label or 'Tool'} failed" + (f": {error}" if error else ""))
+                notify = "tool"
+            elif name in ("Stop", "SessionEnd") and rec.live:
+                for label in rec.open_calls.values():
+                    rec.log.append(f"✗ Not run: {label}")  # e.g. a call that was denied: it never gets a result event
+                rec.open_calls.clear()
+                rec.status = "complete" if name == "Stop" else "interrupted"
+                rec.summary = str(ev.get("last_assistant_message") or rec.summary)[:2000]
+                rec.ended = t
+                rec.log.append(_closing_line(rec))
+                logger.info("[Slack] claude-code run %s finished: %s tools=%d chat=%s", rec.subagent_id, name, rec.tool_count, chat)
+                notify = "stop"
+        if notify:
+            self._notify(rec, notify)
 
     def on_tool(self, **kw: Any) -> None:
         with self._lock:
@@ -207,6 +303,7 @@ class SubagentTracker:
             tool = str(kw.get("tool_name") or "tool")
             preview = _arg_preview(kw.get("args"))
             rec.last_tool = friendly_title(f"{tool} - {preview}" if preview else tool)
+            rec.log.append(rec.last_tool)
         self._notify(rec, "tool")
 
 
@@ -241,6 +338,7 @@ class SlackSubagentMixin:
         self._subagent_loop: Optional[asyncio.AbstractEventLoop] = None
         self._subagent_view_last: dict[str, float] = {}
         self._subagent_view_pending: dict[str, Any] = {}
+        self._claude_poll_task: Optional[Any] = None
         TRACKER.attach(self)
 
     # ── from hooks (any thread) ──
@@ -259,34 +357,80 @@ class SlackSubagentMixin:
             logger.debug("[Slack] subagent update failed", exc_info=True)
 
     # ── card rows ──
+    @staticmethod
+    def _rows_for(stream: Any) -> list[SubagentRecord]:
+        """Runs that overlapped this card's lifetime: still live, or finished after the card opened.
+        (Without this, every finished run in a channel would reappear on all later cards.)"""
+        opened = getattr(stream, "created_wall", 0.0) - 2.0
+        return [r for r in TRACKER.for_chat(stream.channel, stream.thread_ts, flat=not stream.thread_ts)
+                if r.live or r.ended >= opened]
+
     def _live_subagent_rows(self, stream: Any) -> list[SubagentRecord]:
         if not subagent_panel_enabled():
             return []
-        return [r for r in TRACKER.for_chat(stream.channel, stream.thread_ts, flat=not stream.thread_ts) if r.live]
+        return [r for r in self._rows_for(stream) if r.live]
+
+    # ── Claude Code events ──
+    def _ensure_claude_poller(self) -> None:
+        """Poll the hook event files while a card is open (cheap: one directory scan per second)."""
+        try:
+            from .claude_code import claude_code_enabled
+        except ImportError:  # flat import (tests)
+            from claude_code import claude_code_enabled  # type: ignore
+        if not claude_code_enabled():
+            return
+        task = self._claude_poll_task
+        if task is None or task.done():
+            self._claude_poll_task = asyncio.ensure_future(self._claude_poll_loop())
+
+    async def _claude_poll_loop(self) -> None:
+        try:
+            from .claude_code import EventReader
+        except ImportError:
+            from claude_code import EventReader  # type: ignore
+        reader = EventReader(TRACKER)
+        reader.cleanup()
+        idle = 0
+        while True:
+            try:
+                reader.poll()
+            except Exception:
+                logger.debug("[Slack] claude-code poll failed", exc_info=True)
+            idle = 0 if self._native_task_card_streams else idle + 1
+            if idle > 30:  # no card open for 30s: nothing to render
+                return
+            await asyncio.sleep(1.0)
 
     def _subagent_task_chunks(self, stream: Any) -> list[dict[str, Any]]:
+        """One ``task_update`` row per tracked run. Slack APPENDS ``details`` across updates, so a row's
+        ``details`` carries only the log lines this card hasn't been sent yet (``stream.log_cursor``);
+        the cursor is committed by the caller after a successful send (``stream.cursor_next``)."""
+        stream.cursor_next = {}
         if not subagent_panel_enabled():
             return []
-        recs = TRACKER.for_chat(stream.channel, stream.thread_ts, flat=not stream.thread_ts)[-6:]
+        recs = self._rows_for(stream)[-6:]
+        closing = getattr(stream, "closing", False)
         chunks = []
         for rec in recs:
+            lines = list(rec.log)
             status = {"complete": "complete", "failed": "error", "interrupted": "error"}.get(rec.status, "in_progress")
-            if rec.live and getattr(stream, "closing", False):
-                # The card is closing but the subagent keeps going: never leave a row in progress.
+            if rec.live and closing:
+                # The card is closing but the run keeps going: never leave a row in progress.
                 status = "complete"
-                details = "running in background" + (" · see the Subagents tab" if self._is_known_code_channel(rec.chat_id) else "")
-            elif rec.live:
-                bits = [f"{rec.tool_count} tool{'s' if rec.tool_count != 1 else ''}"] if rec.tool_count else []
-                if rec.last_tool:
-                    bits.append(rec.last_tool)
-                if rec.status == "stopping":
-                    bits.append("stopping…")
-                details = " · ".join(bits)
+                lines.append("↪ Running in background")
+            elif rec.live and rec.status == "stopping":
+                lines.append("⏹ Stopping…")
+            sent = stream.log_cursor.get(rec.subagent_id, 0)
+            fresh = lines[sent:]
+            stream.cursor_next[rec.subagent_id] = len(lines)
+            if rec.kind == "claude":
+                title = "🤖 Claude Code" + (f": {rec.goal}" if rec.goal else "")
             else:
-                dur = f"{int(rec.ended - rec.started)}s" if rec.ended else ""
-                details = " · ".join(b for b in (f"{rec.tool_count} tools", dur, rec.status if status == "error" else "") if b)
-            chunks.append({"type": "task_update", "id": f"sub-{rec.subagent_id}"[:64],
-                           "title": f"🔀 {rec.goal or 'Subagent'}"[:120], "status": status, "details": details[:300]})
+                title = f"🔀 {rec.goal or 'Subagent'}"
+            chunk = {"type": "task_update", "id": f"sub-{rec.subagent_id}"[:64], "title": title[:120], "status": status}
+            if fresh:
+                chunk["details"] = ("\n" if sent else "") + "\n".join(fresh)
+            chunks.append(chunk)
         return chunks
 
     async def _refresh_subagent_cards(self, rec: SubagentRecord) -> None:

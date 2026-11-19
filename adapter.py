@@ -348,6 +348,9 @@ class _NativeTaskCardStream:
     last_title: Optional[str] = None
     last_reply_to: Optional[str] = None
     last_metadata: Optional[dict] = None
+    created_wall: float = field(default_factory=time.time)
+    log_cursor: dict = field(default_factory=dict)  # row id -> log lines already sent (Slack appends `details`)
+    cursor_next: dict = field(default_factory=dict)
     closing: bool = False  # final frame: live subagent rows are handed off, not left in progress
     flush_task: Optional[Any] = None
 
@@ -2107,6 +2110,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             if stream.stopped:
                 return SendResult(success=False, error="Progress stream already stopped")
             self._subagent_loop = asyncio.get_running_loop()
+            self._ensure_claude_poller()
             stream.last_tasks, stream.last_title = tasks, title
             stream.last_reply_to, stream.last_metadata = reply_to, metadata
             interval = self._native_task_card_interval(stream)
@@ -2137,16 +2141,20 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             client = self._get_client(chat_id, team_id=stream.team_id)
             if not stream.stream_ts:
                 await self._start_native_task_card_stream(client, stream, metadata)
-            # Flat (Code channel) cards have no plan heading: steps sit in one block, untitled.
-            chunks: list[dict[str, Any]] = (
-                [{"type": "plan_update", "title": str(title)[:256]}] if stream.thread_ts else [])
-            for task in tasks:
-                chunk = self._task_update_chunk(task)
-                if not stream.thread_ts:
-                    chunk["title"] = _friendly_title(chunk["title"])[:256]
-                chunks.append(chunk)
-            chunks.extend(self._subagent_task_chunks(stream))
-            # chunks-only: Slack rejects markdown_text alongside chunks
+            def build_chunks() -> list[dict[str, Any]]:
+                # Flat (Code channel) cards have no plan heading: steps sit in one block, untitled.
+                out: list[dict[str, Any]] = (
+                    [{"type": "plan_update", "title": str(title)[:256]}] if stream.thread_ts else [])
+                for task in tasks:
+                    chunk = self._task_update_chunk(task)
+                    if not stream.thread_ts:
+                        chunk["title"] = _friendly_title(chunk["title"])[:256]
+                    out.append(chunk)
+                out.extend(self._subagent_task_chunks(stream))
+                return out
+
+            chunks = build_chunks()
+            # chunks-only: Slack rejects the top-level markdown_text parameter alongside chunks
             # (cannot_provide_both_markdown_text_and_chunks, #87743); the gateway owns
             # the editable-text fallback rail that fallback_text feeds when this call fails.
             try:
@@ -2163,9 +2171,12 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                     "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                     "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts or "(flat)")
                 stream.stream_ts = ""
+                stream.log_cursor.clear()  # the new message has no history: resend each row's whole log
                 await self._start_native_task_card_stream(client, stream, metadata)
+                chunks = build_chunks()
                 await client.api_call(
                     "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
+            stream.log_cursor.update(stream.cursor_next)
             stream.last_sent = time.monotonic()
             return SendResult(success=True, message_id=stream.stream_ts)
         except Exception as exc:  # pragma: no cover - defensive logging
