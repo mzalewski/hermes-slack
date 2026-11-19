@@ -265,20 +265,26 @@ def cc(t, name, sid="sess1", ts=100.0, chat="C1", thread="", **ev):
                        "event": {"hook_event_name": name, "session_id": sid, "cwd": "/repo", **ev}})
 
 
-def test_claude_run_lifecycle_and_titles(monkeypatch):
+def test_claude_run_lifecycle_and_its_own_stream_chunks(monkeypatch):
     t = tracker(monkeypatch)
     cc(t, "UserPromptSubmit", prompt="fix the add bug", ts=100)
     cc(t, "PreToolUse", tool_name="Read", tool_use_id="u1", tool_input={"file_path": "/repo/calc.py"}, ts=101)
     cc(t, "PostToolUse", tool_name="Read", tool_use_id="u1", ts=102)
     cc(t, "PreToolUse", tool_name="Edit", tool_use_id="u2", tool_input={"file_path": "/repo/calc.py"}, ts=103)
-    cc(t, "PostToolUseFailure", tool_name="Edit", tool_use_id="u2", error="old_string not found", ts=104)
-    cc(t, "Stop", last_assistant_message="Fixed it.", ts=110)
     rec = t.for_chat("C1")[0]
-    assert rec.kind == "claude" and rec.status == "complete" and rec.summary == "Fixed it."
-    assert rec.log[:3] == ["Reading calc.py", "Editing calc.py", "✗ Failed: old_string not found"]
-    assert rec.log[-1].startswith("✓ Done")
-    row = Mixin()._subagent_task_chunks(S())[0]
-    assert row["title"] == "🤖 Claude Code: fix the add bug" and row["status"] == "complete"
+    running = Mixin()._claude_chunks(rec)
+    assert running[0] == {"type": "plan_update", "title": "🤖 Claude Code: fix the add bug"}
+    assert [(c["title"], c["status"]) for c in running[1:]] == [("Reading calc.py", "complete"), ("Editing calc.py", "in_progress")]
+    cc(t, "PostToolUseFailure", tool_name="Edit", tool_use_id="u2", error="old_string not found", ts=104)
+    cc(t, "Stop", last_assistant_message="Fixed it. Also tidied imports.", ts=110)
+    assert rec.kind == "claude" and rec.status == "complete" and rec.summary.startswith("Fixed it.")
+    assert [(s["label"], s["status"], s["detail"]) for s in rec.steps] == [
+        ("Reading calc.py", "complete", ""), ("Editing calc.py", "error", "old_string not found")]
+    done = Mixin()._claude_chunks(rec, final=True)
+    assert done[0]["title"] == "🤖 Claude Code · Fixed it."  # first sentence of Claude's own summary
+    assert [(c["title"], c["status"]) for c in done[1:]] == [
+        ("Reading calc.py", "complete"), ("Editing calc.py · old_string not found", "error")]
+    assert Mixin()._subagent_task_chunks(S()) == []  # Claude runs never appear on the Hermes card
 
 
 def test_claude_denied_call_is_closed_as_not_run_on_stop(monkeypatch):
@@ -287,7 +293,8 @@ def test_claude_denied_call_is_closed_as_not_run_on_stop(monkeypatch):
     cc(t, "PreToolUse", tool_name="Bash", tool_use_id="u1", tool_input={"command": "pytest -q"}, ts=101)  # never gets a result
     cc(t, "Stop", ts=105)
     rec = t.for_chat("C1")[0]
-    assert "✗ Not run: Running pytest -q" in rec.log and not rec.open_calls and not rec.live
+    step = rec.steps[0]
+    assert (step["status"], step["detail"]) == ("error", "not run") and not rec.open_calls and not rec.live
 
 
 def test_claude_killed_run_closes_on_session_end_as_interrupted(monkeypatch):
@@ -297,11 +304,18 @@ def test_claude_killed_run_closes_on_session_end_as_interrupted(monkeypatch):
     assert t.for_chat("C1")[0].status == "interrupted"
 
 
-def test_claude_events_without_prompt_still_tracked_and_title_has_prefix(monkeypatch):
+def test_claude_events_without_prompt_still_tracked_and_heading_has_prefix(monkeypatch):
     t = tracker(monkeypatch)
     cc(t, "PreToolUse", tool_name="Grep", tool_use_id="u1", tool_input={"pattern": "TODO"}, ts=100)
-    row = Mixin()._subagent_task_chunks(S())[0]
-    assert row["title"] == "🤖 Claude Code" and row["details"] == "Searching TODO"
+    chunks = Mixin()._claude_chunks(t.for_chat("C1")[0])
+    assert chunks[0]["title"] == "🤖 Claude Code" and chunks[1]["title"] == "Searching TODO"
+
+
+def test_killed_run_heading_says_stopped(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "UserPromptSubmit", prompt="x", ts=100)
+    cc(t, "SessionEnd", ts=101)
+    assert Mixin()._claude_chunks(t.for_chat("C1")[0], final=True)[0]["title"] == "🤖 Claude Code · Stopped"
 
 
 def test_claude_second_prompt_in_same_session_is_a_new_row_and_chats_isolated(monkeypatch):

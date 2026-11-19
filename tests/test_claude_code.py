@@ -156,9 +156,11 @@ class M(sa.SlackSubagentMixin):
 def test_card_only_shows_runs_overlapping_its_lifetime(monkeypatch):
     t = sa.SubagentTracker()
     monkeypatch.setattr(sa, "TRACKER", t)
+    monkeypatch.setattr(sa, "_session_env", lambda: ("slack", "C1", ""))
     base = time.time()
-    t.on_claude_event({"t": base - 500, "chat": "C1", "event": {"hook_event_name": "UserPromptSubmit", "session_id": "old", "prompt": "yesterday"}})
-    t.on_claude_event({"t": base - 400, "chat": "C1", "event": {"hook_event_name": "Stop", "session_id": "old"}})
-    t.on_claude_event({"t": base, "chat": "C1", "event": {"hook_event_name": "UserPromptSubmit", "session_id": "new", "prompt": "today"}})
+    t.on_start(child_subagent_id="old", child_goal="yesterday", child_session_id="a", parent_session_id="p")
+    t.on_stop(child_session_id="a", child_status="completed")
+    t.get("old").ended = base - 400
+    t.on_start(child_subagent_id="new", child_goal="today", child_session_id="b", parent_session_id="p")
     st = types.SimpleNamespace(channel="C1", thread_ts="", log_cursor={}, cursor_next={}, closing=False, created_wall=base - 10)
-    assert [r["title"] for r in M()._subagent_task_chunks(st)] == ["🤖 Claude Code: today"]
+    assert [r["title"] for r in M()._subagent_task_chunks(st)] == ["🔀 today"]
