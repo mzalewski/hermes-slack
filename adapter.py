@@ -68,6 +68,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_vault_code import SlackVaultCodeMixin
     from .code_channels import SlackCodeChannelMixin
+    from .subagents import SlackSubagentMixin, STOP_ACTION as _SUBAGENT_STOP, RESULT_ACTION as _SUBAGENT_RESULT
     from .task_labels import friendly_title as _friendly_title
     from .adapter_image_batch import collect_image_uploads
     from .adapter_forwarded import (
@@ -84,6 +85,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
     from code_channels import SlackCodeChannelMixin  # type: ignore
+    from subagents import SlackSubagentMixin, STOP_ACTION as _SUBAGENT_STOP, RESULT_ACTION as _SUBAGENT_RESULT  # type: ignore
     from task_labels import friendly_title as _friendly_title  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
 
@@ -342,6 +344,10 @@ class _NativeTaskCardStream:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_sent: float = 0.0  # monotonic time of the last appendStream
     pending: Optional[tuple] = None  # (tasks, title, metadata) held back by the throttle
+    last_tasks: Optional[list] = None  # last frame from core, re-sent when subagent rows change
+    last_title: Optional[str] = None
+    last_reply_to: Optional[str] = None
+    last_metadata: Optional[dict] = None
     flush_task: Optional[Any] = None
 
 
@@ -998,7 +1004,7 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
-class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChannelMixin, BasePlatformAdapter):
+class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChannelMixin, SlackSubagentMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1125,6 +1131,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         # off / missing scope); later responses skip straight to edit-based streaming.
         self._native_stream_unsupported = False
         self._init_code_channel_state()  # Slack Code channels (code_channels.py)
+        self._init_subagent_state()  # subagent monitoring (subagents.py)
         # Socket Mode self-healing state for silently dropped websockets; the monotonic
         # start time is the grace window for the first ping/pong.
         self._app_token: Optional[str] = None
@@ -1666,6 +1673,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         for _action_id in self._CONFIRM_CHOICES:
             self._app.action(_action_id)(self._handle_slash_confirm_action)
         self._app.action("hermes_feedback")(self._handle_feedback_action)
+        self._app.action(_SUBAGENT_STOP)(self._handle_subagent_action)
+        self._app.action(_SUBAGENT_RESULT)(self._handle_subagent_action)
         # Clarify buttons (tools/clarify_gateway.py); indexed action IDs because
         # Block Kit requires unique IDs within an actions block.
         self._app.action(re.compile(r"^hermes_clarify_choice_\d+$"))(self._handle_clarify_action)
@@ -2096,6 +2105,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
         async with stream.lock:
             if stream.stopped:
                 return SendResult(success=False, error="Progress stream already stopped")
+            self._subagent_loop = asyncio.get_running_loop()
+            stream.last_tasks, stream.last_title = tasks, title
+            stream.last_reply_to, stream.last_metadata = reply_to, metadata
             interval = self._native_task_card_interval(stream)
             wait = interval - (time.monotonic() - stream.last_sent)
             if stream.stream_ts and wait > 0:
@@ -2132,6 +2144,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
                 if not stream.thread_ts:
                     chunk["title"] = _friendly_title(chunk["title"])[:256]
                 chunks.append(chunk)
+            chunks.extend(self._subagent_task_chunks(stream))
             # chunks-only: Slack rejects markdown_text alongside chunks
             # (cannot_provide_both_markdown_text_and_chunks, #87743); the gateway owns
             # the editable-text fallback rail that fallback_text feeds when this call fails.
@@ -7130,6 +7143,11 @@ def register(ctx) -> None:
     from .send_targets import SEND_ENTRY_KWARGS
     from .dashboard_card import DASHBOARD_CARD
     from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
+    try:  # observer hooks for subagent monitoring; must never stop the platform from loading
+        from .subagents import register_hooks
+        register_hooks(ctx)
+    except Exception:  # pragma: no cover - hook API missing on older Hermes
+        logger.warning("[Slack] subagent hooks not registered", exc_info=True)
     ctx.register_platform(
         **SEND_ENTRY_KWARGS,  # send_message target syntax + routing
         name="slack",

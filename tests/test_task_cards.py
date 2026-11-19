@@ -114,3 +114,34 @@ def test_friendly_titles(mod):
     assert f("terminal - pytest -q") == "Running pytest -q"
     assert f("todo") == "Updating plan"
     assert f("mystery_tool - x") == "mystery_tool - x"
+
+
+def test_subagent_rows_appear_on_card_and_refresh_pushes_them(mod, monkeypatch):
+    sa = sys.modules[mod.__name__.rsplit(".", 1)[0] + ".subagents"]
+    tracker = sa.SubagentTracker()
+    monkeypatch_target, env_target = sa.TRACKER, sa._session_env
+    sa.TRACKER = tracker
+    try:
+        monkeypatch.setenv("SLACK_SUBAGENT_PANEL", "true")
+        sa._session_env = lambda: ("slack", "C1", "")
+
+        async def go():
+            a = make(mod, interval=0)
+            await a.send_native_task_card_progress("C1", [task(1)], metadata={})
+            tracker.on_start(child_subagent_id="s1", child_goal="Audit token expiry", child_session_id="cs1",
+                             parent_session_id="p1")
+            tracker.on_tool(task_id="s1", tool_name="read_file", args={"path": "auth.py"})
+            await a._subagent_apply(tracker.get("s1"), "tool")
+            last = [c for c in a.client.calls if c[0] == "chat.appendStream"][-1][1]["chunks"]
+            rows = [c for c in last if c["id"].startswith("sub-")]
+            assert len(rows) == 1 and rows[0]["title"].startswith("🔀 Audit token expiry")
+            assert "1 tool" in rows[0]["details"]
+            # core's own task is still there and keeps its plain-language title
+            assert last[0]["title"] == "Opening f1.py"
+            tracker.on_stop(child_session_id="cs1", child_status="completed", child_summary="done")
+            await a._subagent_apply(tracker.get("s1"), "stop")
+            last = [c for c in a.client.calls if c[0] == "chat.appendStream"][-1][1]["chunks"]
+            assert [c for c in last if c["id"].startswith("sub-")][0]["status"] == "complete"
+        run(go())
+    finally:
+        sa.TRACKER, sa._session_env = monkeypatch_target, env_target
