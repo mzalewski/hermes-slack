@@ -331,3 +331,102 @@ def test_hooks_registered_and_the_panel_flag_disables_them(monkeypatch):
     assert set(registered) == {"pre_llm_call", "subagent_start", "subagent_stop", "pre_tool_call", "post_tool_call"}
     registered["subagent_start"](child_subagent_id="zz", child_goal="x")  # disabled: no record
     assert t.get("zz") is None
+
+
+# ── Claude's own words between tool calls ─────────────────────────────────────
+def narrate(t, name="Read", uid="u1", text="Checking the config first.", mid="m1", ts=101.0, **extra):
+    t.on_claude_event({"t": ts, "chat": "C1", "thread": "", "pid": 4242, "narration": text, "narration_id": mid,
+                       "event": {"hook_event_name": "PreToolUse", "session_id": "sess1", "cwd": "/repo", "tool_name": name,
+                                 "tool_use_id": uid, "tool_input": {"file_path": "/repo/a.py"}, **extra}})
+
+
+def test_narration_is_queued_with_the_step_it_precedes_and_deduped(monkeypatch):
+    t = tracker(monkeypatch)
+    cc(t, "UserPromptSubmit", prompt="go", ts=100)
+    narrate(t, uid="u1", mid="m1", text="First, the config.")
+    narrate(t, uid="u2", mid="m1", text="First, the config.")  # parallel call from the same message: not repeated
+    cc(t, "PostToolUse", tool_name="Read", tool_use_id="u1", ts=102)
+    narrate(t, uid="u3", mid="m2", text="Now the tests.")
+    rec = t.for_chat("C1")[0]
+    assert rec.narrations == [("First, the config.", 0), ("Now the tests.", 2)]
+    assert len(rec.steps) == 3
+
+
+def test_narration_flag_off_queues_nothing(monkeypatch):
+    t = tracker(monkeypatch)
+    monkeypatch.setenv("SLACK_CLAUDE_NARRATION", "false")
+    cc(t, "UserPromptSubmit", prompt="go", ts=100)
+    narrate(t)
+    assert t.for_chat("C1")[0].narrations == [] and len(t.for_chat("C1")[0].steps) == 1
+
+
+class Flow(sa.SlackSubagentMixin):
+    """Records what reaches Slack, in order."""
+
+    def __init__(self):
+        self.log = []
+        self._run_cards = {}
+        self._run_narration_lock = asyncio.Lock()
+        self._native_task_card_streams = {}
+        self.n = 0
+
+    def _run_card_thread(self, rec):
+        return ""
+
+    def _run_team(self, chat):
+        return "T1"
+
+    def _native_task_card_interval(self, stream):
+        return 0.0
+
+    async def _close_cards_for_run(self, chat, thread):
+        pass
+
+    async def _start_native_task_card_stream(self, client, card, reply_to):
+        self.n += 1
+        card.stream_ts = f"s{self.n}"
+        self.log.append(("start", card.stream_ts))
+
+    async def send(self, chat, text, reply_to=None, metadata=None):
+        self.log.append(("say", text))
+        return types.SimpleNamespace(success=True)
+
+    def _get_client(self, chat, team_id=None):
+        flow = self
+
+        class C:
+            async def api_call(self, method, json=None):
+                if method == "chat.appendStream":
+                    flow.log.append(("append", json["ts"], json["chunks"][0]["title"], [c["title"] for c in json["chunks"][1:]]))
+                else:
+                    flow.log.append((method.split(".")[1], json["ts"]))
+        return C()
+
+
+def test_claude_words_become_messages_and_later_steps_open_a_new_card(monkeypatch):
+    t = tracker(monkeypatch)
+    f = Flow()
+
+    async def go():
+        cc(t, "UserPromptSubmit", prompt="go", ts=100)
+        narrate(t, uid="u1", mid="m1", text="First, the config.")
+        rec = t.for_chat("C1")[0]
+        await f._run_card_update(rec, "tool")
+        cc(t, "PostToolUse", tool_name="Read", tool_use_id="u1", ts=102)
+        narrate(t, name="Edit", uid="u2", mid="m2", text="Now fixing it.")
+        await f._run_card_update(rec, "tool")
+        cc(t, "PostToolUse", tool_name="Edit", tool_use_id="u2", ts=104)
+        cc(t, "Stop", last_assistant_message="All done. Details.", ts=110)
+        await f._run_card_update(rec, "stop")
+    run(go())
+    kinds = [e[0] for e in f.log]
+    assert kinds == ["say", "start", "append", "append", "stopStream", "say", "start", "append", "append", "stopStream"]
+    assert f.log[0] == ("say", "🤖 Claude Code: First, the config.")
+    first_card = [e for e in f.log if e[0] == "append" and e[1] == "s1"]
+    assert first_card[-1][2] == "🤖 Claude Code · Reading a.py" and first_card[-1][3] == ["Reading a.py"]  # closed, with its own steps
+    second_card = [e for e in f.log if e[0] == "append" and e[1] == "s2"]
+    assert second_card[0][2].startswith("🤖 Claude Code: Now fixing it") and second_card[0][3] == ["Editing a.py"]  # only the steps after the words
+    assert second_card[-1][2] == "🤖 Claude Code · All done." and second_card[-1][3] == ["Editing a.py"]
+    say_at = [i for i, e in enumerate(f.log) if e[0] == "say"]
+    stop_s1 = next(i for i, e in enumerate(f.log) if e == ("stopStream", "s1"))
+    assert stop_s1 < say_at[1]  # the first card is sealed before the message that follows it

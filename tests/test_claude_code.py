@@ -150,3 +150,34 @@ def test_install_refuses_invalid_json_and_dry_run_writes_nothing(tmp_path):
 # ── card scoping ──
 
 
+
+
+# ── the hook reads Claude's words from the transcript ──
+def _transcript(tmp_path, rows):
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return str(p)
+
+
+def _asst(mid, block):
+    return {"type": "assistant", "uuid": mid + str(len(str(block))), "message": {"id": mid, "content": [block]}}
+
+
+def test_hook_finds_the_text_written_just_before_a_tool_call(tmp_path):
+    hook = load("slack_cc_hook", "claude_code_hook.py")
+    path = _transcript(tmp_path, [
+        {"type": "user", "message": {"content": "go"}},
+        _asst("m1", {"type": "text", "text": "Checking the config first."}),
+        _asst("m1", {"type": "tool_use", "id": "tu1", "name": "Read", "input": {}}),
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1"}]}},
+        _asst("m2", {"type": "tool_use", "id": "tu2", "name": "Bash", "input": {}}),  # no words before this one
+        _asst("m3", {"type": "text", "text": "Two parts."}), _asst("m3", {"type": "text", "text": "Second part."}),
+        _asst("m3", {"type": "tool_use", "id": "tu3", "name": "Edit", "input": {}}),
+    ])
+    ev = lambda tid, **k: {"hook_event_name": "PreToolUse", "transcript_path": path, "tool_use_id": tid, **k}
+    assert hook._narration(ev("tu1")) == ("m1", "Checking the config first.")
+    assert hook._narration(ev("tu2")) == ("m2", "")  # the previous message's words are not repeated
+    assert hook._narration(ev("tu3")) == ("m3", "Two parts.\nSecond part.")
+    assert hook._narration(ev("nope")) == ("", "")
+    assert hook._narration({**ev("tu1"), "hook_event_name": "PostToolUse"}) == ("", "")
+    assert hook._narration({"hook_event_name": "PreToolUse", "transcript_path": "/missing", "tool_use_id": "x"}) == ("", "")

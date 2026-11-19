@@ -55,6 +55,10 @@ def subagent_view_enabled() -> bool:
     return _flag("SLACK_SUBAGENT_VIEW", "false")
 
 
+def claude_narration_enabled() -> bool:
+    return _flag("SLACK_CLAUDE_NARRATION")
+
+
 def subagent_controls_enabled() -> bool:
     return _flag("SLACK_SUBAGENT_CONTROLS")
 
@@ -77,6 +81,10 @@ class SubagentRecord:
     kind: str = "hermes"  # "hermes" (delegate_task child) | "claude" (Claude Code run launched by Hermes)
     steps: list = field(default_factory=list)  # Claude Code: one dict per tool call -> its own bullet row on the card
     open_calls: dict = field(default_factory=dict)  # Claude Code tool_use_id -> step dict, for calls with no result yet
+    narrations: list = field(default_factory=list)  # Claude Code: (text, step index it precedes), not yet posted
+    narration_ids: set = field(default_factory=set)  # message ids already queued (parallel tool calls share one)
+    seg_start: int = 0  # index of the first step of the card segment now being built
+    seg_title: str = ""  # first sentence of the narration that opened this segment
     pid: int = 0  # Claude Code's process id (for a future per-run Stop)
     cwd: str = ""
 
@@ -125,6 +133,7 @@ class _RunCard:
     last_event: float = field(default_factory=time.monotonic)
     pending: bool = False
     flush_task: Optional[Any] = None
+    start: int = 0  # index of this card's first step in the run's steps
 
 
 def _step_row_id(step: dict) -> str:
@@ -313,6 +322,11 @@ class SubagentTracker:
                 tool = str(ev.get("tool_name") or "tool")
                 preview = _claude_preview(ev.get("tool_input"), rec.cwd)
                 rec.last_tool = friendly_title(f"{tool} - {preview}" if preview else tool)
+                said = str(item.get("narration") or "").strip()
+                said_id = str(item.get("narration_id") or said[:40])
+                if said and said_id not in rec.narration_ids and claude_narration_enabled():
+                    rec.narration_ids.add(said_id)
+                    rec.narrations.append((said, len(rec.steps)))  # it precedes the step appended just below
                 step = {"id": f"{rec.subagent_id}-{len(rec.steps) + 1}", "label": rec.last_tool, "status": "in_progress", "detail": ""}
                 rec.steps.append(step)
                 rec.open_calls[str(ev.get("tool_use_id") or step["id"])] = step
@@ -408,6 +422,7 @@ class SlackSubagentMixin:
         self._subagent_view_last: dict[str, float] = {}
         self._subagent_view_pending: dict[str, Any] = {}
         self._claude_poll_task: Optional[Any] = None
+        self._run_narration_lock = asyncio.Lock()
         self._run_cards: dict[str, "_RunCard"] = {}  # run id -> its own stream
         self._carried_excludes: dict[Any, set] = {}  # card key -> task ids an earlier, closed card already showed
         TRACKER.attach(self)
@@ -475,13 +490,17 @@ class SlackSubagentMixin:
         return next((s.team_id for s in self._native_task_card_streams.values() if s.channel == chat_id), "")
 
     @staticmethod
-    def _run_heading(rec: SubagentRecord, final: bool) -> str:
-        """While running: "🤖 Claude Code: <prompt>" / "🔀 <goal>". Closed: "· <first sentence of its own
-        summary>", or "Stopped" / "Failed"."""
+    def _run_heading(rec: SubagentRecord, final: bool, start: int = 0, end: Optional[int] = None) -> str:
+        """While running: "🤖 Claude Code: <prompt>" / "🔀 <goal>"; a later segment of a run that narrated
+        opens with that narration's first sentence. Closed: "· <first sentence of its own summary>", or
+        "Stopped" / "Failed"; a segment closed mid-run ends with its last step."""
         claude = rec.kind == "claude"
         base = "🤖 Claude Code" if claude else "🔀 Subagent"
+        if end is not None:  # closed because Claude spoke: this segment is done
+            last = rec.steps[end - 1]["label"] if end > start and end <= len(rec.steps) else "Done"
+            return f"{base} · {last}"
         if not final:
-            goal = _short_title(rec.goal)
+            goal = _short_title(rec.seg_title if (claude and start and rec.seg_title) else rec.goal)
             if claude:
                 return f"{base}: {goal}" if goal else base
             return f"🔀 {goal}" if goal else base
@@ -489,22 +508,26 @@ class SlackSubagentMixin:
             _short_title(rec.summary, 70) or (rec.steps[-1]["label"] if rec.steps else "Done"))
         return f"{base} · {suffix}"
 
-    def _run_chunks(self, rec: SubagentRecord, final: bool = False) -> list[dict[str, Any]]:
-        chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": self._run_heading(rec, final)[:256]}]
-        for step in rec.steps[-_MAX_STEP_ROWS:]:
+    def _run_chunks(self, rec: SubagentRecord, final: bool = False, start: int = 0,
+                    end: Optional[int] = None) -> list[dict[str, Any]]:
+        """Frame for the steps ``start:end`` of the run. ``end`` set = the segment is closed (all rows done)."""
+        closing = end is not None
+        chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": self._run_heading(rec, final, start, end)[:256]}]
+        for step in rec.steps[start:end][-_MAX_STEP_ROWS:]:
             status = {"complete": "complete", "error": "error"}.get(step["status"], "in_progress")
-            if final and status == "in_progress":
+            if (final or closing) and status == "in_progress":
                 status = "complete"
             label = step["label"] + (f" · {step['detail']}" if step["detail"] else "")
             chunks.append({"type": "task_update", "id": _step_row_id(step), "title": label[:120], "status": status})
         return chunks
 
-    async def _run_send(self, card: "_RunCard", rec: SubagentRecord, final: bool) -> None:
+    async def _run_send(self, card: "_RunCard", rec: SubagentRecord, final: bool, end: Optional[int] = None) -> None:
         try:
             client = self._get_client(card.channel, team_id=card.team_id or None)
             if not card.stream_ts:
                 await self._start_native_task_card_stream(client, card, None)
-            payload = {"channel": card.channel, "ts": card.stream_ts, "chunks": self._run_chunks(rec, final)}
+            payload = {"channel": card.channel, "ts": card.stream_ts,
+                       "chunks": self._run_chunks(rec, final, card.start, end)}
             try:
                 await client.api_call("chat.appendStream", json=payload)
             except Exception as exc:
@@ -525,12 +548,15 @@ class SlackSubagentMixin:
         thread = self._run_card_thread(rec)
         if thread is None:
             return
+        if rec.narrations:
+            await self._run_post_narrations(rec, thread)
         card = self._run_cards.get(rec.subagent_id)
         created = False
         if card is None:
-            if not rec.steps:
-                return
-            card = _RunCard(team_id=self._run_team(rec.chat_id), channel=rec.chat_id, thread_ts=thread)
+            if len(rec.steps) <= rec.seg_start:
+                return  # nothing new to draw (e.g. the run ended right after Claude spoke)
+            card = _RunCard(team_id=self._run_team(rec.chat_id), channel=rec.chat_id, thread_ts=thread,
+                            start=rec.seg_start)
             self._run_cards[rec.subagent_id] = card
             created = True
         card.last_event = time.monotonic()
@@ -558,6 +584,34 @@ class SlackSubagentMixin:
                             "chat.stopStream", json={"channel": card.channel, "ts": card.stream_ts})
                 except Exception:
                     logger.debug("[Slack] claude-code stopStream failed", exc_info=True)
+
+    async def _run_post_narrations(self, rec: SubagentRecord, thread: str) -> None:
+        """Claude spoke: close the card of the steps so far, post what it said as a real message, and let the
+        steps after it open a new card below. Serialized so two quick events keep their order."""
+        async with self._run_narration_lock:
+            while rec.narrations:
+                text, index = rec.narrations.pop(0)
+                card = self._run_cards.get(rec.subagent_id)
+                if card is not None:
+                    async with card.lock:
+                        if not card.stopped:
+                            if card.flush_task is not None and not card.flush_task.done():
+                                card.flush_task.cancel()
+                            if index > card.start:
+                                await self._run_send(card, rec, False, end=index)
+                            card.stopped = True
+                            try:
+                                if card.stream_ts:
+                                    await self._get_client(card.channel, team_id=card.team_id or None).api_call(
+                                        "chat.stopStream", json={"channel": card.channel, "ts": card.stream_ts})
+                            except Exception:
+                                logger.debug("[Slack] claude-code stopStream failed", exc_info=True)
+                    self._run_cards.pop(rec.subagent_id, None)
+                rec.seg_start, rec.seg_title = index, text
+                try:
+                    await self.send(rec.chat_id, "🤖 Claude Code: " + text[:700], reply_to=rec.thread_ts or None)
+                except Exception:
+                    logger.warning("[Slack] claude-code narration post failed", exc_info=True)
 
     async def _run_flush_later(self, rec: SubagentRecord, card: "_RunCard", delay: float) -> None:
         await asyncio.sleep(delay)

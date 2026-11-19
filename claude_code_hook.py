@@ -33,6 +33,44 @@ def _trim(event):
     return out
 
 
+def _narration(event):
+    """What Claude wrote just before this tool call: ``(message id, text)``. The assistant message that holds
+    the tool call is written to the transcript as several lines sharing one message id; the text block(s) are
+    the narration. Reads only the tail of the file; ``("", "")`` on any problem."""
+    path, want = event.get("transcript_path"), event.get("tool_use_id")
+    if event.get("hook_event_name") != "PreToolUse" or not path or not want:
+        return "", ""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 262144))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+        rows = []
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+        message_id = ""
+        for row in reversed(rows):
+            content = (row.get("message") or {}).get("content")
+            if row.get("type") == "assistant" and isinstance(content, list) and any(
+                    b.get("type") == "tool_use" and b.get("id") == want for b in content if isinstance(b, dict)):
+                message_id = row["message"].get("id") or row.get("uuid") or ""
+                break
+        if not message_id:
+            return "", ""
+        texts = []
+        for row in rows:
+            msg = row.get("message") or {}
+            if row.get("type") == "assistant" and msg.get("id") == message_id and isinstance(msg.get("content"), list):
+                texts += [b.get("text", "") for b in msg["content"] if isinstance(b, dict) and b.get("type") == "text"]
+        return message_id, "\n".join(t.strip() for t in texts if t and t.strip())[:800]
+    except Exception:
+        return "", ""
+
+
 def main():
     chat = os.environ.get("HERMES_SESSION_CHAT_ID", "")
     if not chat or os.environ.get("HERMES_SESSION_PLATFORM", "") != "slack":
@@ -44,6 +82,9 @@ def main():
     safe_chat = re.sub(r"[^A-Za-z0-9_.-]", "_", chat)[:64]
     record = {"t": round(time.time(), 3), "chat": chat, "thread": os.environ.get("HERMES_SESSION_THREAD_ID", ""),
               "pid": os.getppid(), "event": _trim(event)}
+    narration_id, narration = _narration(event)
+    if narration:
+        record["narration_id"], record["narration"] = narration_id, narration
     directory = _events_dir()
     os.makedirs(directory, mode=0o700, exist_ok=True)
     fd = os.open(os.path.join(directory, safe_chat + ".jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
