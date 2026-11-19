@@ -348,6 +348,7 @@ class _NativeTaskCardStream:
     last_title: Optional[str] = None
     last_reply_to: Optional[str] = None
     last_metadata: Optional[dict] = None
+    closing: bool = False  # final frame: live subagent rows are handed off, not left in progress
     flush_task: Optional[Any] = None
 
 
@@ -2214,6 +2215,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, SlackCodeChan
             if stream.pending is not None and not stream.stopped:
                 tasks, title, metadata = stream.pending
                 await self._append_native_task_card(stream, tasks, title, metadata)  # final frame
+            if stream.stream_ts and stream.last_tasks is not None and self._live_subagent_rows(stream):
+                # Slack shows a closed card with unfinished tasks as "Something went wrong". Subagents
+                # (async delegation) often outlive the turn, so hand their rows off before closing.
+                stream.closing = True
+                await self._append_native_task_card(stream, stream.last_tasks, stream.last_title or "", stream.last_metadata)
             stream.stopped = True
             try:
                 if self._app and stream.stream_ts:

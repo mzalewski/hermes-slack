@@ -176,6 +176,7 @@ class SubagentTracker:
             while len(self._records) > _MAX_RECORDS:
                 _, old = self._records.popitem(last=False)
                 self._by_session.pop(old.child_session_id, None)
+        logger.info("[Slack] subagent %s started in chat=%s thread=%s", sid, chat_id, thread or "-")
         self._notify(rec, "start")
 
     def on_stop(self, **kw: Any) -> None:
@@ -190,6 +191,8 @@ class SubagentTracker:
             rec.summary = str(kw.get("child_summary") or "")[:2000]
             duration_ms = kw.get("duration_ms")
             rec.ended = rec.started + duration_ms / 1000.0 if isinstance(duration_ms, (int, float)) and duration_ms > 0 else time.time()
+        logger.info("[Slack] subagent %s finished: status=%s (raw=%r) tools=%d chat=%s", rec.subagent_id, rec.status,
+                    kw.get("child_status"), rec.tool_count, rec.chat_id)
         self._notify(rec, "stop")
 
     def on_tool(self, **kw: Any) -> None:
@@ -256,6 +259,11 @@ class SlackSubagentMixin:
             logger.debug("[Slack] subagent update failed", exc_info=True)
 
     # ── card rows ──
+    def _live_subagent_rows(self, stream: Any) -> list[SubagentRecord]:
+        if not subagent_panel_enabled():
+            return []
+        return [r for r in TRACKER.for_chat(stream.channel, stream.thread_ts, flat=not stream.thread_ts) if r.live]
+
     def _subagent_task_chunks(self, stream: Any) -> list[dict[str, Any]]:
         if not subagent_panel_enabled():
             return []
@@ -263,8 +271,12 @@ class SlackSubagentMixin:
         chunks = []
         for rec in recs:
             status = {"complete": "complete", "failed": "error", "interrupted": "error"}.get(rec.status, "in_progress")
-            if rec.live:
-                bits = [f"{rec.tool_count} tool{'s' if rec.tool_count != 1 else ''}"]
+            if rec.live and getattr(stream, "closing", False):
+                # The card is closing but the subagent keeps going: never leave a row in progress.
+                status = "complete"
+                details = "running in background" + (" · see the Subagents tab" if self._is_known_code_channel(rec.chat_id) else "")
+            elif rec.live:
+                bits = [f"{rec.tool_count} tool{'s' if rec.tool_count != 1 else ''}"] if rec.tool_count else []
                 if rec.last_tool:
                     bits.append(rec.last_tool)
                 if rec.status == "stopping":

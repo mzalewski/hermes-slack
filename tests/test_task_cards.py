@@ -145,3 +145,29 @@ def test_subagent_rows_appear_on_card_and_refresh_pushes_them(mod, monkeypatch):
         run(go())
     finally:
         sa.TRACKER, sa._session_env = monkeypatch_target, env_target
+
+
+def test_card_close_hands_off_running_subagent_rows(mod):
+    sa = sys.modules[mod.__name__.rsplit(".", 1)[0] + ".subagents"]
+    tracker, orig_t, orig_e = sa.SubagentTracker(), sa.TRACKER, sa._session_env
+    sa.TRACKER = tracker
+    sa._session_env = lambda: ("slack", "C1", "")
+    try:
+        async def go():
+            a = make(mod, interval=0)
+            await a.send_native_task_card_progress("C1", [task(1, "complete")], metadata={})
+            tracker.on_start(child_subagent_id="s1", child_goal="Count files", child_session_id="cs1", parent_session_id="p1")
+            await a._subagent_apply(tracker.get("s1"), "start")
+            mid = [c for c in a.client.calls if c[0] == "chat.appendStream"][-1][1]["chunks"]
+            assert [c for c in mid if c["id"] == "sub-s1"][0]["status"] == "in_progress"
+            assert "details" in mid[-1] and "0 tools" not in mid[-1]["details"]
+            await a.stop_native_task_card_progress("C1", metadata={})
+            methods = [c[0] for c in a.client.calls]
+            assert methods[-1] == "chat.stopStream"
+            final = [c for c in a.client.calls if c[0] == "chat.appendStream"][-1][1]["chunks"]
+            row = [c for c in final if c["id"] == "sub-s1"][0]
+            assert row["status"] == "complete" and "background" in row["details"]
+            assert not any(c["status"] == "in_progress" for c in final)  # nothing left open at close
+        run(go())
+    finally:
+        sa.TRACKER, sa._session_env = orig_t, orig_e
